@@ -7,11 +7,12 @@
 window.OLYMPUS_CONFIG = {
   allowedEmail: "khayla.mcgowan@customink.com",
   firebase: {
-    apiKey: "PASTE_API_KEY",
-    authDomain: "PASTE_PROJECT_ID.firebaseapp.com",
-    projectId: "PASTE_PROJECT_ID",
-    storageBucket: "PASTE_PROJECT_ID.appspot.com",
-    messagingSenderId: "PASTE_SENDER_ID",
-    appId: "PASTE_APP_ID"
+    apiKey: "AIzaSyBrfH_zAqSRKC-Akl43k6Qab8-p7ku4cD8",
+    authDomain: "olympus-hub-d7a51.firebaseapp.com",
+    projectId: "olympus-hub-d7a51",
+    storageBucket: "olympus-hub-d7a51.firebasestorage.app",
+    messagingSenderId: "847979797557",
+    appId: "1:847979797557:web:e4a4539b951de8e745257c",
+    measurementId: "G-3YBSY2M3XD"
   }
 };
