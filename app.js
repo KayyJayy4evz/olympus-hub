@@ -35,7 +35,7 @@ const CATS = {
   other:{label:'Uncategorized', color:'var(--c-other)', tpl:[]}
 };
 const NOTE_TYPES = {win:'Win', coach:'Coaching', oneone:'1:1 note', concern:'Concern', note:'Note'};
-const OUT_TYPES = ['PTO','Sick','Training','Other'];
+const OUT_TYPES = ['PL','UPL','Training','Other'];
 const CAL = 'Google Calendar';
 const OLLY = [
   'Monday: pick the one thing that makes this week easier, and do it first.',
@@ -153,7 +153,53 @@ async function loadCalendar(){
   }
   scheduleRender();
 }
-function startCalendar(){ clearInterval(calTimer); loadCalendar(); calTimer = setInterval(loadCalendar, 300000); }
+function startCalendar(){ clearInterval(calTimer); loadCalendar(); loadTeamCal(); calTimer = setInterval(() => { loadCalendar(); loadTeamCal(); }, 300000); }
+
+/* ---- Olympus Team Calendar: "Name - PL" / "Name : UPL" / "Name PL" all-day entries mark people out ---- */
+const teamCal = {status:'idle', off:{}, unmatched:[], storedAt:null};
+const OUT_RE = /^(.*?)[\s\-–—:|,]+(UPL|PL)\b/i;
+function matchMember(raw){
+  const n = raw.toLowerCase().replace(/[^a-z' ]/g,' ').replace(/\s+/g,' ').trim();
+  if(!n) return null;
+  const team = teamList();
+  const tok = n.split(' ');
+  const full = team.find(m => m.name.toLowerCase()===n); if(full) return full;
+  const firsts = team.filter(m => m.name.toLowerCase().split(' ')[0]===tok[0] || (m.aliases||[]).map(a=>a.toLowerCase()).includes(tok[0]));
+  if(firsts.length===1) return firsts[0];
+  if(firsts.length>1 && tok[1]){ const byInitial = firsts.filter(m => m.name.toLowerCase().split(' ').slice(-1)[0].startsWith(tok[1])); if(byInitial.length===1) return byInitial[0]; }
+  return null;
+}
+async function loadTeamCal(){
+  const id = CFG.teamCalendarId;
+  if(!id || !gcal.token()){ teamCal.status = 'connect'; return; }
+  const t = today(), from = addDays(t, -14), to = addDays(t, 120);
+  try{
+    const items = []; let page = '';
+    for(let i = 0; i < 6; i++){
+      const q = new URLSearchParams({timeMin: parseYmd(from).toISOString(), timeMax: parseYmd(to).toISOString(), singleEvents:'true', orderBy:'startTime', maxResults:'250'});
+      if(page) q.set('pageToken', page);
+      const j = await gcal.api('/calendars/' + encodeURIComponent(id) + '/events?' + q.toString());
+      items.push(...((j && j.items) || [])); page = j && j.nextPageToken; if(!page) break;
+    }
+    const off = {}, unmatched = new Set();
+    for(const e of items){
+      if(e.status==='cancelled' || !e.start) continue;
+      const m = OUT_RE.exec((e.summary || '').trim()); if(!m) continue;
+      const type = m[2].toUpperCase();
+      const who = matchMember(m[1]);
+      let d, end;
+      if(e.start.date){ d = e.start.date; end = (e.end && e.end.date) || addDays(d,1); }
+      else { d = ymd(new Date(e.start.dateTime)); end = addDays(ymd(new Date((e.end && e.end.dateTime) || e.start.dateTime)), 1); }
+      for(let k = 0; d < end && k < 120; k++, d = addDays(d,1)){
+        if(!who){ if(d >= t && d <= addDays(t,13)) unmatched.add(m[1].trim()); continue; }
+        (off[who.id] = off[who.id] || {})[d] = type;
+      }
+    }
+    teamCal.off = off; teamCal.unmatched = [...unmatched].sort(); teamCal.status = 'ok'; teamCal.storedAt = Date.now();
+  }catch(e){ teamCal.status = e.code==='needs_connect' ? 'connect' : e.code==='forbidden' ? 'denied' : 'error'; }
+  scheduleRender();
+}
+const calOffFor = (memberId, date) => (teamCal.off[memberId] || {})[date] || null;
 async function connectCalendar(){
   if(!auth || !auth.currentUser){ toast('Sign in first.'); return; }
   try{
@@ -233,13 +279,14 @@ async function pushToCalendar(id){
 /* =============== schedules =============== */
 function dayPlan(m, date){
   const sh = m.shift || {};
-  const off = (m.off || {})[date] || null;
+  const manualOff = (m.off || {})[date] || null, calOff = calOffFor(m.id, date);
+  const off = manualOff || calOff;
   const dow = parseYmd(date).getDay();
   const set = !!(sh.start && sh.end && Array.isArray(sh.days));
   const works = set && sh.days.includes(dow);
   const s = toMin(sh.start), e = toMin(sh.end);
   const ls = sh.lunch ? toMin(sh.lunch) : null, le = ls!=null ? ls + (Number(sh.lunchLen)||30) : null;
-  return {set, works, off, s, e, ls, le};
+  return {set, works, off, fromCal: !manualOff && !!calOff, s, e, ls, le};
 }
 function statusAt(m, date, min){
   const p = dayPlan(m, date);
@@ -410,6 +457,7 @@ function vSummit(){
         <div class="panel-h"><h2>The floor right now</h2><div class="right"><a class="btn sm ghost" href="#sundial">Sundial</a></div></div>
         ${floor}
       </section>
+      ${outPanel()}
       <section class="panel">
         <div class="panel-h"><h2>Lunch watch</h2><span class="small muted">next 2.5 hours</span></div>
         ${lunches.length ? `<ul class="tasks">${lunches.map(x => `<li class="task" style="grid-template-columns:minmax(0,1fr) auto"><span>${esc(x.m.name)} <span class="small muted">${x.m.channel==='chat'?'Chat':'Voice'}</span></span><span class="chip ${x.p.ls<=nm?'lunch':'later'} tnum">${x.p.ls<=nm?'At lunch until '+esc(fmtTime(fromMin(x.p.le))):esc(fmtTime(fromMin(x.p.ls)))+' to '+esc(fmtTime(fromMin(x.p.le)))}</span></li>`).join('')}</ul>`
@@ -418,6 +466,24 @@ function vSummit(){
     </div>
   </div>
   ${toolsPanel()}`;
+}
+function outPanel(){
+  const t = today(), team = teamList();
+  const days = []; for(let i = 0; i < 14 && days.length < 5; i++){ const d = addDays(t, i); const dow = parseYmd(d).getDay(); if(dow===0 || dow===6) continue; days.push(d); }
+  const rows = days.map(d => {
+    const outs = team.map(m => ({m, p: dayPlan(m, d)})).filter(x => x.p.off).sort((a,b) => a.m.name.localeCompare(b.m.name));
+    return `<div class="stack" style="gap:6px"><div class="flabel" style="${d===t?'color:var(--accent)':''}">${esc(relDay(d))}${d!==t && d!==addDays(t,1) ? '' : ' · ' + esc(fmtDate(d,{weekday:'short'}))}</div>
+      ${outs.length ? `<div class="people">${outs.map(x => `<span class="chip out" title="${x.p.fromCal ? 'From Olympus Team Calendar' : 'Set in Sundial'}">${esc(x.m.name.split(' ')[0])} · ${esc(x.p.off)}</span>`).join('')}</div>` : '<span class="small muted">Everyone in</span>'}</div>`;
+  }).join('');
+  const note = teamCal.status==='ok'
+    ? (teamCal.unmatched.length ? `<div class="small muted">On the team calendar but not on your roster: ${teamCal.unmatched.map(esc).join(', ')}</div>` : '')
+    : teamCal.status==='denied' ? '<div class="small" style="color:var(--bad)">Google refused access to the Olympus Team Calendar.</div>'
+    : teamCal.status==='error' ? '<div class="small muted">Team calendar did not respond. It retries every 5 minutes.</div>'
+    : '<div class="small muted">Connect your calendar to pull PL and UPL from the Olympus Team Calendar. <button class="btn sm" data-act="calRetry">Connect calendar</button></div>';
+  return `<section class="panel">
+    <div class="panel-h"><h2>Out this week</h2>${teamCal.status==='ok' ? '<span class="chip on">Team calendar synced</span>' : ''}</div>
+    ${rows}${note}
+  </section>`;
 }
 function calChip(){
   const s = cal.status;
@@ -561,7 +627,7 @@ function vSundial(){
       if(p.ls!=null && !off) bars += `<div class="bar lunchb" style="left:${pos(p.ls)}%;width:${(p.le-p.ls)/span*100}%" title="Lunch ${fmtTime(fromMin(p.ls))} to ${fmtTime(fromMin(p.le))}">L</div>`;
     }
     return `<div class="tl-row"><div class="tl-name"><span class="nm" title="${esc(m.name)}">${esc(m.name)}</span>
-      <select aria-label="${esc(m.name)} availability on ${esc(date)}" data-act-change="setOff" data-id="${esc(m.id)}"><option value="">${p.works ? 'In' : p.set ? 'Off' : 'Unset'}</option>${OUT_TYPES.map(o => `<option ${off===o?'selected':''}>${o}</option>`).join('')}</select></div>
+      ${p.fromCal ? `<span class="chip out" title="From Olympus Team Calendar">${esc(off)} · cal</span>` : `<select aria-label="${esc(m.name)} availability on ${esc(date)}" data-act-change="setOff" data-id="${esc(m.id)}"><option value="">${p.works ? 'In' : p.set ? 'Off' : 'Unset'}</option>${OUT_TYPES.map(o => `<option ${off===o?'selected':''}>${o}</option>`).join('')}</select>`}</div>
       <div class="tl-track">${hours.map(t => `<div class="tl-hour" style="left:${pos(t)}%"></div>`).join('')}${bars}${!p.set ? '<span class="small muted" style="position:absolute;left:10px;top:10px">No shift set</span>' : !p.works ? '<span class="small muted" style="position:absolute;left:10px;top:10px">Not scheduled</span>' : ''}${showNow ? `<div class="nowline" style="left:${pos(nm)}%"></div>` : ''}</div></div>`;
   };
   const groups = ['chat','voice'].filter(ch => ui.sunChannel==='all' || ui.sunChannel===ch);
