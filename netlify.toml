@@ -3,6 +3,12 @@
   command = ""
 
 [[headers]]
+  for = "/__/firebase/init.json"
+  [headers.values]
+    Content-Type = "application/json"
+    Cache-Control = "no-cache"
+
+[[headers]]
   for = "/*"
   [headers.values]
     X-Robots-Tag = "noindex, nofollow"
@@ -15,12 +21,6 @@
 [[redirects]]
   from = "/__/auth/*"
   to = "https://olympus-hub-d7a51.firebaseapp.com/__/auth/:splat"
-  status = 200
-  force = true
-
-[[redirects]]
-  from = "/__/firebase/*"
-  to = "https://olympus-hub-d7a51.firebaseapp.com/__/firebase/:splat"
   status = 200
   force = true
 
