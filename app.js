@@ -156,7 +156,7 @@ async function loadCalendar(){
 function startCalendar(){ clearInterval(calTimer); loadCalendar(); loadTeamCal(); calTimer = setInterval(() => { loadCalendar(); loadTeamCal(); }, 300000); }
 
 /* ---- Olympus Team Calendar: "Name - PL" / "Name : UPL" / "Name PL" all-day entries mark people out ---- */
-const teamCal = {status:'idle', off:{}, unmatched:[], storedAt:null};
+const teamCal = {status:'idle', off:{}, adj:{}, unmatched:[], storedAt:null};
 const OUT_RE = /^(.*?)[\s\-–—:|,]+(UPL|PL)\b/i;
 function matchMember(raw){
   const n = raw.toLowerCase().replace(/[^a-z' ]/g,' ').replace(/\s+/g,' ').trim();
@@ -167,6 +167,47 @@ function matchMember(raw){
   const firsts = team.filter(m => m.name.toLowerCase().split(' ')[0]===tok[0] || (m.aliases||[]).map(a=>a.toLowerCase()).includes(tok[0]));
   if(firsts.length===1) return firsts[0];
   if(firsts.length>1 && tok[1]){ const byInitial = firsts.filter(m => m.name.toLowerCase().split(' ').slice(-1)[0].startsWith(tok[1])); if(byInitial.length===1) return byInitial[0]; }
+  return null;
+}
+/* Partial-day changes: "Lauren H In 8-530", "Whitney Out at 5:00 PM EST",
+   "Whitney out 1:00 PM - 3:30 PM Split Shift", "Lauren H out 330 EST", "Hannah in 10:30-4" */
+const ADJ_RE = /^(.*?)[\s\-–—:|,]+(in|out)\b(.*)$/i;
+const T = String.raw`(\d{1,2}:\d{2}|\d{3,4}|\d{1,2})\s*(a\.?m\.?|p\.?m\.?|a|p)?\b`;
+const RANGE_RE = new RegExp(T + String.raw`\s*(?:-|–|—|to|until|till|til)\s*` + T, 'i');
+const ONE_RE = new RegExp(T, 'i');
+function clock(tok, ap, guess = true){
+  let h, m = 0;
+  if(tok.includes(':')) [h, m] = tok.split(':').map(Number);
+  else if(tok.length <= 2) h = +tok;
+  else { h = +tok.slice(0, -2); m = +tok.slice(-2); }
+  if(!(h >= 0 && h <= 23 && m >= 0 && m <= 59)) return null;
+  if(ap){ const p = ap[0].toLowerCase(); if(p==='p' && h < 12) h += 12; if(p==='a' && h===12) h = 0; }
+  else if(guess && h >= 1 && h <= 6) h += 12; /* contact-center hours: 1 to 6 means afternoon */
+  return h*60 + m;
+}
+function parseAdj(title, ev){
+  const mm = ADJ_RE.exec(title); if(!mm) return null;
+  const nameRaw = mm[1].trim(); if(!nameRaw || nameRaw.split(/\s+/).length > 3) return null;
+  const who = matchMember(nameRaw); if(!who) return null;
+  const kind = mm[2].toLowerCase(), rest = mm[3] || '';
+  const r = RANGE_RE.exec(rest);
+  let a = null, b = null;
+  if(r){
+    const ap2 = r[4], ap1 = r[2] || null;
+    a = clock(r[1], ap1 || (ap2 && clock(r[1], ap2, false) < clock(r[3], ap2, false) ? ap2 : null));
+    b = clock(r[3], ap2);
+    if(a!=null && b!=null && b <= a && b + 720 < 1440) b += 720;
+  } else {
+    const o = ONE_RE.exec(rest); if(o) a = clock(o[1], o[2]);
+  }
+  if(kind==='in'){
+    if(a!=null && b!=null) return {who, start:a, end:b, label:'In ' + fmtTime(fromMin(a)) + ' to ' + fmtTime(fromMin(b))};
+    if(a!=null) return {who, start:a, label:'In at ' + fmtTime(fromMin(a))};
+    return null;
+  }
+  if(a!=null && b!=null) return {who, gap:[a,b], label:'Out ' + fmtTime(fromMin(a)) + ' to ' + fmtTime(fromMin(b))};
+  if(a!=null) return {who, end:a, label:'Leaves ' + fmtTime(fromMin(a))};
+  if(ev.start.dateTime){ const s0 = new Date(ev.start.dateTime), e0 = new Date((ev.end && ev.end.dateTime) || ev.start.dateTime); const g = [s0.getHours()*60+s0.getMinutes(), e0.getHours()*60+e0.getMinutes()]; return {who, gap:g, label:'Out ' + fmtTime(fromMin(g[0])) + ' to ' + fmtTime(fromMin(g[1]))}; }
   return null;
 }
 async function loadTeamCal(){
@@ -181,10 +222,24 @@ async function loadTeamCal(){
       const j = await gcal.api('/calendars/' + encodeURIComponent(id) + '/events?' + q.toString());
       items.push(...((j && j.items) || [])); page = j && j.nextPageToken; if(!page) break;
     }
-    const off = {}, unmatched = new Set();
+    const off = {}, adj = {}, unmatched = new Set();
     for(const e of items){
       if(e.status==='cancelled' || !e.start) continue;
-      const m = OUT_RE.exec((e.summary || '').trim()); if(!m) continue;
+      const title = (e.summary || '').trim();
+      const m = OUT_RE.exec(title);
+      if(!m){
+        const a = parseAdj(title, e); if(!a) continue;
+        let d0 = e.start.date || ymd(new Date(e.start.dateTime));
+        const end0 = e.start.date ? ((e.end && e.end.date) || addDays(d0,1)) : addDays(d0,1);
+        for(let k = 0; d0 < end0 && k < 60; k++, d0 = addDays(d0,1)){
+          const slot = ((adj[a.who.id] = adj[a.who.id] || {})[d0] = adj[a.who.id][d0] || {gaps:[], labels:[]});
+          if(a.start!=null) slot.start = a.start;
+          if(a.end!=null) slot.end = a.end;
+          if(a.gap) slot.gaps.push(a.gap);
+          slot.labels.push(a.label);
+        }
+        continue;
+      }
       const type = m[2].toUpperCase();
       const who = matchMember(m[1]);
       let d, end;
@@ -195,11 +250,12 @@ async function loadTeamCal(){
         (off[who.id] = off[who.id] || {})[d] = type;
       }
     }
-    teamCal.off = off; teamCal.unmatched = [...unmatched].sort(); teamCal.status = 'ok'; teamCal.storedAt = Date.now();
+    teamCal.off = off; teamCal.adj = adj; teamCal.unmatched = [...unmatched].sort(); teamCal.status = 'ok'; teamCal.storedAt = Date.now();
   }catch(e){ teamCal.status = e.code==='needs_connect' ? 'connect' : e.code==='forbidden' ? 'denied' : 'error'; }
   scheduleRender();
 }
 const calOffFor = (memberId, date) => (teamCal.off[memberId] || {})[date] || null;
+const calAdjFor = (memberId, date) => (teamCal.adj[memberId] || {})[date] || null;
 async function connectCalendar(){
   if(!auth || !auth.currentUser){ toast('Sign in first.'); return; }
   try{
@@ -283,10 +339,13 @@ function dayPlan(m, date){
   const off = manualOff || calOff;
   const dow = parseYmd(date).getDay();
   const set = !!(sh.start && sh.end && Array.isArray(sh.days));
-  const works = set && sh.days.includes(dow);
-  const s = toMin(sh.start), e = toMin(sh.end);
+  const adj = off ? null : calAdjFor(m.id, date);
+  let works = set && sh.days.includes(dow);
+  let s = toMin(sh.start), e = toMin(sh.end);
+  if(adj){ if(adj.start!=null) s = adj.start; if(adj.end!=null) e = adj.end; if(adj.start!=null && adj.end!=null && set) works = true; }
+  const gaps = adj ? adj.gaps.filter(g => g[1] > g[0]) : [];
   const ls = sh.lunch ? toMin(sh.lunch) : null, le = ls!=null ? ls + (Number(sh.lunchLen)||30) : null;
-  return {set, works, off, fromCal: !manualOff && !!calOff, s, e, ls, le};
+  return {set, works, off, fromCal: !manualOff && !!calOff, s, e, ls, le, gaps, adj: adj ? adj.labels.join(' · ') : null};
 }
 function statusAt(m, date, min){
   const p = dayPlan(m, date);
@@ -295,6 +354,8 @@ function statusAt(m, date, min){
   if(!p.works) return {k:'off', label:'Off today'};
   if(min < p.s) return {k:'later', label:'Starts ' + fmtTime(fromMin(p.s))};
   if(min >= p.e) return {k:'off', label:'Done at ' + fmtTime(fromMin(p.e))};
+  const g = p.gaps.find(x => min>=x[0] && min<x[1]);
+  if(g) return {k:'out', label:'Out until ' + fmtTime(fromMin(g[1]))};
   if(p.ls!=null && min>=p.ls && min<p.le) return {k:'lunch', label:'Lunch until ' + fmtTime(fromMin(p.le))};
   return {k:'on', label:'On until ' + fmtTime(fromMin(p.e))};
 }
@@ -471,9 +532,12 @@ function outPanel(){
   const t = today(), team = teamList();
   const days = []; for(let i = 0; i < 14 && days.length < 5; i++){ const d = addDays(t, i); const dow = parseYmd(d).getDay(); if(dow===0 || dow===6) continue; days.push(d); }
   const rows = days.map(d => {
-    const outs = team.map(m => ({m, p: dayPlan(m, d)})).filter(x => x.p.off).sort((a,b) => a.m.name.localeCompare(b.m.name));
+    const all = team.map(m => ({m, p: dayPlan(m, d)})).sort((a,b) => a.m.name.localeCompare(b.m.name));
+    const outs = all.filter(x => x.p.off), adjs = all.filter(x => !x.p.off && x.p.adj);
+    const chips = outs.map(x => `<span class="chip out" title="${x.p.fromCal ? 'From Olympus Team Calendar' : 'Set in Sundial'}">${esc(x.m.name.split(' ')[0])} · ${esc(x.p.off)}</span>`)
+      .concat(adjs.map(x => `<span class="chip warn" title="From Olympus Team Calendar">${esc(x.m.name.split(' ')[0])} · ${esc(x.p.adj)}</span>`));
     return `<div class="stack" style="gap:6px"><div class="flabel" style="${d===t?'color:var(--accent)':''}">${esc(relDay(d))}${d!==t && d!==addDays(t,1) ? '' : ' · ' + esc(fmtDate(d,{weekday:'short'}))}</div>
-      ${outs.length ? `<div class="people">${outs.map(x => `<span class="chip out" title="${x.p.fromCal ? 'From Olympus Team Calendar' : 'Set in Sundial'}">${esc(x.m.name.split(' ')[0])} · ${esc(x.p.off)}</span>`).join('')}</div>` : '<span class="small muted">Everyone in</span>'}</div>`;
+      ${chips.length ? `<div class="people">${chips.join('')}</div>` : '<span class="small muted">Everyone in, regular hours</span>'}</div>`;
   }).join('');
   const note = teamCal.status==='ok'
     ? (teamCal.unmatched.length ? `<div class="small muted">On the team calendar but not on your roster: ${teamCal.unmatched.map(esc).join(', ')}</div>` : '')
@@ -481,7 +545,7 @@ function outPanel(){
     : teamCal.status==='error' ? '<div class="small muted">Team calendar did not respond. It retries every 5 minutes.</div>'
     : '<div class="small muted">Connect your calendar to pull PL and UPL from the Olympus Team Calendar. <button class="btn sm" data-act="calRetry">Connect calendar</button></div>';
   return `<section class="panel">
-    <div class="panel-h"><h2>Out this week</h2>${teamCal.status==='ok' ? '<span class="chip on">Team calendar synced</span>' : ''}</div>
+    <div class="panel-h"><h2>Out &amp; changes this week</h2>${teamCal.status==='ok' ? '<span class="chip on">Team calendar synced</span>' : ''}</div>
     ${rows}${note}
   </section>`;
 }
@@ -615,7 +679,7 @@ function vSundial(){
   const slots = []; for(let t = lo; t < hi; t += 30) slots.push(t);
   const cov = ch => slots.map(t => {
     let on = 0, lunch = 0;
-    plans.filter(x => x.m.channel===ch && x.p.works && !x.p.off).forEach(x => { if(t>=x.p.s && t<x.p.e){ if(x.p.ls!=null && t>=x.p.ls && t<x.p.le) lunch++; else on++; } });
+    plans.filter(x => x.m.channel===ch && x.p.works && !x.p.off).forEach(x => { if(t>=x.p.s && t<x.p.e && !x.p.gaps.some(g => t>=g[0] && t<g[1])){ if(x.p.ls!=null && t>=x.p.ls && t<x.p.le) lunch++; else on++; } });
     const lh = maxL[ch] && lunch > maxL[ch];
     return `<i class="${on?'':'z'} ${lh?'lh':''}" style="background:color-mix(in srgb,var(--${ch}) ${Math.min(on*9,55)}%,transparent)" title="${fmtTime(fromMin(t))}: ${on} on floor, ${lunch} at lunch">${on}</i>`;
   }).join('');
@@ -624,9 +688,10 @@ function vSundial(){
     let bars = '';
     if(p.set && p.works){
       bars += `<div class="bar ${off?'outb':m.channel}" style="left:${pos(p.s)}%;width:${(p.e-p.s)/span*100}%">${off ? esc(off) : esc(fmtTime(fromMin(p.s))+' to '+fmtTime(fromMin(p.e)))}</div>`;
+      if(!off) p.gaps.forEach(g => { bars += `<div class="bar outb" style="left:${pos(Math.max(g[0],p.s))}%;width:${Math.max(0,(Math.min(g[1],p.e)-Math.max(g[0],p.s)))/span*100}%;z-index:2" title="${esc('Out ' + fmtTime(fromMin(g[0])) + ' to ' + fmtTime(fromMin(g[1])))}">Out</div>`; });
       if(p.ls!=null && !off) bars += `<div class="bar lunchb" style="left:${pos(p.ls)}%;width:${(p.le-p.ls)/span*100}%" title="Lunch ${fmtTime(fromMin(p.ls))} to ${fmtTime(fromMin(p.le))}">L</div>`;
     }
-    return `<div class="tl-row"><div class="tl-name"><span class="nm" title="${esc(m.name)}">${esc(m.name)}</span>
+    return `<div class="tl-row"><div class="tl-name"><span class="nm" title="${esc(m.name)}${p.adj ? ': ' + esc(p.adj) : ''}">${esc(m.name)}${p.adj ? ' <span class="chip warn" style="padding:0 6px;font-size:11px" title="' + esc(p.adj) + ' (Olympus Team Calendar)">adj</span>' : ''}</span>
       ${p.fromCal ? `<span class="chip out" title="From Olympus Team Calendar">${esc(off)} · cal</span>` : `<select aria-label="${esc(m.name)} availability on ${esc(date)}" data-act-change="setOff" data-id="${esc(m.id)}"><option value="">${p.works ? 'In' : p.set ? 'Off' : 'Unset'}</option>${OUT_TYPES.map(o => `<option ${off===o?'selected':''}>${o}</option>`).join('')}</select>`}</div>
       <div class="tl-track">${hours.map(t => `<div class="tl-hour" style="left:${pos(t)}%"></div>`).join('')}${bars}${!p.set ? '<span class="small muted" style="position:absolute;left:10px;top:10px">No shift set</span>' : !p.works ? '<span class="small muted" style="position:absolute;left:10px;top:10px">Not scheduled</span>' : ''}${showNow ? `<div class="nowline" style="left:${pos(nm)}%"></div>` : ''}</div></div>`;
   };
