@@ -981,7 +981,9 @@ function authMsg(e){
   if(c==='auth/popup-blocked') return 'Your browser blocked the sign-in popup. Allow popups for this site.';
   if(c==='auth/popup-closed-by-user' || c==='auth/cancelled-popup-request') return 'Sign-in was closed before finishing.';
   if(c==='auth/user-mismatch') return 'Pick the same Google account you signed in with.';
-  if(c==='auth/unauthorized-domain') return 'This domain is not on Firebase Authorized domains yet.';
+  if(c==='auth/unauthorized-domain') return 'This web address is not on Firebase Authorized domains yet (Authentication, Settings).';
+  if(c==='auth/network-request-failed') return 'Could not reach Google. Check your connection and try again.';
+  if(c==='auth/internal-error') return 'Google sign-in hit an internal error. This is usually the redirect URI setting; see the setup notes.';
   if(c==='auth/operation-not-allowed') return 'Google sign-in is not enabled in Firebase Authentication.';
   return 'Sign-in failed: ' + ((e && (e.message || e.code)) || 'unknown error');
 }
@@ -994,11 +996,24 @@ function showGate(kind, extra){
   }[kind];
   $('#gate-card').innerHTML = `<div class="meander" style="margin:-28px -28px 8px"></div><span class="eyebrow">Tier 2 · Partner</span><div class="gname">OLYMPUS</div>${t}`;
   const b = $('#gate-signin');
-  if(b) b.onclick = async () => {
-    try{ const r = await auth.signInWithPopup(googleProvider()); if(r.credential && r.credential.accessToken) gcal.save(r.credential.accessToken); }
-    catch(e){ const m = $('#gate-msg'); if(m) m.textContent = authMsg(e); }
-  };
+  if(b){
+    const card = $('#gate-card');
+    card.insertAdjacentHTML('beforeend', '<button class="btn sm ghost" id="gate-redirect" type="button">Popup not working? Sign in on a full page</button>');
+    b.onclick = async () => {
+      gateMsg('Finishing sign-in...', false);
+      try{
+        const r = await auth.signInWithPopup(googleProvider());
+        if(r.credential && r.credential.accessToken) gcal.save(r.credential.accessToken);
+        if(!r.user) gateMsg('Google finished, but the hub did not receive the sign-in. Try the full-page option below.', true);
+      }catch(e){ console.error('Sign-in failed', e); gateMsg(authMsg(e), true); }
+    };
+    $('#gate-redirect').onclick = async () => {
+      gateMsg('Taking you to Google...', false);
+      try{ await auth.signInWithRedirect(googleProvider()); }catch(e){ console.error('Redirect sign-in failed', e); gateMsg(authMsg(e), true); }
+    };
+  }
 }
+function gateMsg(text, isErr){ const m = $('#gate-msg'); if(!m) return; m.textContent = text; m.style.color = isErr ? 'var(--bad)' : 'var(--muted)'; m.style.fontWeight = isErr ? '500' : '400'; }
 function hideGate(){ $('#gate').hidden = true; }
 function stopData(){ unsubs.forEach(u => { try{ u(); }catch(e){} }); unsubs = []; for(const k of Object.keys(S)) S[k] = {}; for(const k of Object.keys(loaded)) delete loaded[k]; clearInterval(calTimer); cal.events = []; cal.status = 'idle'; }
 function startData(){
@@ -1054,6 +1069,8 @@ function boot(){
   if(!fb.apiKey || /PASTE/.test(fb.apiKey)){ showGate('setup'); return; }
   firebase.initializeApp(fb);
   auth = firebase.auth(); db = firebase.firestore();
+  auth.getRedirectResult().then(r => { if(r && r.credential && r.credential.accessToken) gcal.save(r.credential.accessToken); })
+    .catch(e => { console.error('Redirect result failed', e); setTimeout(() => gateMsg(authMsg(e), true), 50); });
   auth.onAuthStateChanged(u => {
     if(!u){ stopData(); if(wrongEmail){ showGate('wrong', wrongEmail); wrongEmail = null; } else showGate('signin'); return; }
     if(CFG.allowedEmail && (u.email || '').toLowerCase() !== CFG.allowedEmail.toLowerCase()){ wrongEmail = u.email || 'That account'; stopData(); gcal.clear(); auth.signOut(); return; }

@@ -8,7 +8,7 @@ window.OLYMPUS_CONFIG = {
   allowedEmail: "khayla.mcgowan@customink.com",
   firebase: {
     apiKey: "AIzaSyBrfH_zAqSRKC-Akl43k6Qab8-p7ku4cD8",
-    authDomain: "olympus-hub-d7a51.firebaseapp.com",
+    authDomain: (location.hostname === "localhost" ? "olympus-hub-d7a51.firebaseapp.com" : location.hostname),
     projectId: "olympus-hub-d7a51",
     storageBucket: "olympus-hub-d7a51.firebasestorage.app",
     messagingSenderId: "847979797557",

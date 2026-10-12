@@ -6,9 +6,23 @@
   for = "/*"
   [headers.values]
     X-Robots-Tag = "noindex, nofollow"
-    X-Frame-Options = "DENY"
+    X-Frame-Options = "SAMEORIGIN"
     X-Content-Type-Options = "nosniff"
     Referrer-Policy = "strict-origin-when-cross-origin"
+
+# Serve Firebase's sign-in handler from this domain, so browsers that block
+# third-party storage (current Chrome, Safari) still complete Google sign-in.
+[[redirects]]
+  from = "/__/auth/*"
+  to = "https://olympus-hub-d7a51.firebaseapp.com/__/auth/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/__/firebase/*"
+  to = "https://olympus-hub-d7a51.firebaseapp.com/__/firebase/:splat"
+  status = 200
+  force = true
 
 # Keep repo-only files off the live site.
 [[redirects]]
