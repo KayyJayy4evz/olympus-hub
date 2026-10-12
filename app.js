@@ -324,7 +324,19 @@ function scheduleRender(){
 }
 document.addEventListener('focusout', () => { if(pending) setTimeout(() => { if(pending){ pending = false; scheduleRender(); } }, 0); });
 
+function showCrash(where, err){
+  console.error('Hub error in ' + where, err);
+  const msg = (err && (err.stack || err.message)) || String(err);
+  let box = document.getElementById('crash');
+  if(!box){ box = document.createElement('pre'); box.id = 'crash'; box.style.cssText = 'position:fixed;left:16px;right:16px;bottom:16px;z-index:200;max-height:40vh;overflow:auto;background:#3e1c1b;color:#ffd9d6;border:1px solid #f3867d;border-radius:10px;padding:12px 14px;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap'; document.body.appendChild(box); }
+  box.textContent = 'Something broke while loading (' + where + '). Screenshot this for Claude:\n\n' + msg.slice(0, 1500);
+}
+window.addEventListener('error', e => showCrash('page', e.error || e.message));
+window.addEventListener('unhandledrejection', e => showCrash('async', e.reason));
 function renderAll(){
+  try{ renderAllInner(); }catch(e){ showCrash('render ' + ui.page, e); }
+}
+function renderAllInner(){
   renderNav();
   const pg = PAGES.find(p => p.id===ui.page);
   $('#pageTitle').innerHTML = `${esc(pg.name)} <small>${esc(pg.label)}</small>`;
@@ -1074,7 +1086,7 @@ function boot(){
   auth.onAuthStateChanged(u => {
     if(!u){ stopData(); if(wrongEmail){ showGate('wrong', wrongEmail); wrongEmail = null; } else showGate('signin'); return; }
     if(CFG.allowedEmail && (u.email || '').toLowerCase() !== CFG.allowedEmail.toLowerCase()){ wrongEmail = u.email || 'That account'; stopData(); gcal.clear(); auth.signOut(); return; }
-    hideGate(); startData(); startCalendar(); renderAll();
+    try{ hideGate(); startData(); startCalendar(); renderAll(); }catch(e){ showCrash('after sign-in', e); }
   });
 }
 boot();
