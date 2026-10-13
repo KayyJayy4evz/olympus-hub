@@ -1,0 +1,10 @@
+{
+  "name": "olympus-hub",
+  "private": true,
+  "type": "module",
+  "description": "Olympus leadership hub. Static site plus three small Netlify functions that keep Google Calendar connected.",
+  "dependencies": {
+    "@netlify/blobs": "8.1.0",
+    "jose": "5.9.6"
+  }
+}

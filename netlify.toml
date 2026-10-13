@@ -9,6 +9,17 @@
     Cache-Control = "no-cache"
 
 [[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache"
+    Service-Worker-Allowed = "/"
+
+[[headers]]
+  for = "/manifest.webmanifest"
+  [headers.values]
+    Content-Type = "application/manifest+json"
+
+[[headers]]
   for = "/*"
   [headers.values]
     X-Robots-Tag = "noindex, nofollow"
@@ -33,6 +44,18 @@
 
 [[redirects]]
   from = "/README.md"
+  to = "/"
+  status = 404
+  force = true
+
+[[redirects]]
+  from = "/netlify/*"
+  to = "/"
+  status = 404
+  force = true
+
+[[redirects]]
+  from = "/package.json"
   to = "/"
   status = 404
   force = true

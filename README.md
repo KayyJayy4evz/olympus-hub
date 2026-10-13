@@ -34,6 +34,16 @@ Open the site, sign in with your Custom Ink account, then on **Summit, Hub tools
 ## If sign-in says "This app is blocked"
 That is Custom Ink's Google Workspace admin policy. Ask IT to allow the OAuth client for this project, or run the hub without the live calendar.
 
+## Calendar that stays connected (one-time server setup)
+Three small Netlify functions in `netlify/functions/` keep Google Calendar connected without hourly reconnects. The refresh token lives in Netlify Blobs; the page only ever gets short-lived access tokens, and only after its Firebase sign-in is verified as the allowed email.
+
+1. **Google Cloud, Credentials, Web client (auto created by Google Service):** add the redirect URI
+   `https://olympus-manager-hub.netlify.app/api/gcal/callback` and Save. Copy the **Client ID** and **Client secret** from the same page.
+2. **Netlify, Site configuration, Environment variables:** add `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` (mark the secret as secret). Then **Deploys, Trigger deploy**.
+3. **Google Cloud, OAuth consent screen (Audience):** set Publishing status to **In production**. In Testing mode Google expires the connection every 7 days. You'll see an "unverified app" screen once; choose Advanced, then continue.
+4. In the hub, click **Connect calendar** once.
+
+Until this is set up, the hub falls back to the hourly popup connection.
+
 ## Notes
-- The calendar connection lasts about an hour per sign-in (a Google limit for browser-only apps). When it lapses, the hub shows **Connect calendar**; one click renews it.
 - `firestore.rules` is the security boundary. Keep the email in it matching `allowedEmail` in `config.js`.

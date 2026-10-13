@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="robots" content="noindex,nofollow">
+<meta name="theme-color" content="#15235A">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Olympus">
 <title>Olympus Leadership Hub</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%2315235A'/%3E%3Cpath d='M4 9l8-4.5L20 9zM6 10v7M10 10v7M14 10v7M18 10v7M4 19.5h16' fill='none' stroke='%23C9982F' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -340,6 +345,16 @@ td.mv.bad{color:var(--bad)}
 .gate-card p{margin:0;color:var(--muted)}
 .gate-card code{background:var(--surface-2);padding:1px 6px;border-radius:5px}
 .gate-card .btn{align-self:flex-start}
+.countdown{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:5px 12px 5px 10px;font-size:13px;max-width:100%;min-width:0;color:var(--fg)}
+.countdown .cd-t{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:32ch}
+.countdown .cd-s{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.countdown .cd-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none}
+.countdown.soon{border-color:var(--warn);background:var(--warn-soft)} .countdown.soon .cd-dot{background:var(--warn);animation:pulse 1.4s ease-in-out infinite}
+.countdown.now{border-color:var(--accent);background:var(--accent-soft)} .countdown.now .cd-dot{background:var(--good)}
+.countdown.done .cd-dot{background:var(--muted)}
+.countdown:disabled{cursor:default}
+@keyframes pulse{50%{opacity:.35}}
+.btn:disabled{opacity:.5;cursor:not-allowed}
 </style>
 </head>
 <body>
@@ -358,6 +373,7 @@ td.mv.bad{color:var(--bad)}
   <div class="main">
     <header class="top">
       <h1 id="pageTitle">Summit <small>Today</small></h1>
+      <button id="countdown" class="countdown" data-act="openMeeting" hidden></button>
       <form class="capture" data-form="capture" autocomplete="off">
         <input id="cap" type="text" placeholder="Capture a task, press Enter" aria-label="Capture a task">
         <button class="btn" type="button" data-act="newMeeting">+ Meeting</button>

@@ -1,0 +1,20 @@
+{
+  "name": "Olympus Leadership Hub",
+  "short_name": "Olympus",
+  "description": "Team Olympus leadership hub: today, meetings, tasks, schedules, team, and metrics.",
+  "start_url": "/#summit",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#15235A",
+  "theme_color": "#15235A",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Meetings", "url": "/#agora" },
+    { "name": "Tasks", "url": "/#labors" },
+    { "name": "Schedules", "url": "/#sundial" }
+  ]
+}

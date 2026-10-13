@@ -71,13 +71,13 @@ function store(k,v){ try{ localStorage.setItem('olympus.'+k, JSON.stringify(v));
 function recall(k,d){ try{ const v = localStorage.getItem('olympus.'+k); return v==null ? d : JSON.parse(v); }catch(e){ return d; } }
 
 /* =============== state =============== */
-const S = {team:{}, meetings:{}, tasks:{}, metrics:{}, notes:{}, config:{}};
+const S = {team:{}, meetings:{}, tasks:{}, metrics:{}, notes:{}, config:{}, daily:{}};
 const loaded = {};
 const cal = {status:'idle', events:[], error:null, storedAt:null};
 const ui = {
   page:'summit', agoraFilter:'all', agoraWhen:'upcoming', laborsFilter:'all', laborsShowDone:false,
   sunDate:today(), sunChannel:recall('sunChannel','all'), oracleWeek:mondayOf(today()), oracleChannel:recall('oracleChannel','chat'),
-  oracleMetric:null, oracleEdit:false, oracleSettings:false, metricDraft:null, modal:null, armed:null
+  oracleMetric:null, oracleEdit:false, oracleSettings:false, paste:null, metricDraft:null, modal:null, armed:null
 };
 let db = null, auth = null, writable = false;
 let unsubs = [];
@@ -115,15 +115,37 @@ const GSCOPE = 'https://www.googleapis.com/auth/calendar.events';
 const TZ = (Intl.DateTimeFormat().resolvedOptions().timeZone) || 'America/New_York';
 const gcal = {
   mem: null,
+  server: 'unknown',   /* 'unknown' | 'connected' | 'disconnected' | 'unconfigured' */
+  _inflight: null,
   token(){
     let t = this.mem;
     if(!t){ try{ t = JSON.parse(sessionStorage.getItem('olympus.gtok') || 'null'); }catch(e){} }
     return t && t.exp > Date.now() ? t.v : null;
   },
-  save(v){ const t = {v, exp: Date.now() + 55*60000}; this.mem = t; try{ sessionStorage.setItem('olympus.gtok', JSON.stringify(t)); }catch(e){} },
+  save(v, ttl = 55*60000){ const t = {v, exp: Date.now() + ttl}; this.mem = t; try{ sessionStorage.setItem('olympus.gtok', JSON.stringify(t)); }catch(e){} },
   clear(){ this.mem = null; try{ sessionStorage.removeItem('olympus.gtok'); }catch(e){} },
+  /* Returns a valid access token, asking the hub's server for a fresh one when needed. */
+  async ensure(){
+    const t = this.token(); if(t) return t;
+    if(this.server==='unconfigured' || this.server==='disconnected') return null;
+    if(this._inflight) return this._inflight;
+    this._inflight = (async () => {
+      try{
+        const u = auth && auth.currentUser; if(!u) return null;
+        const id = await u.getIdToken();
+        const r = await fetch('/api/gcal/token', {method:'POST', headers:{Authorization:'Bearer ' + id}});
+        const j = await r.json().catch(() => null);
+        if(r.ok && j && j.access_token){ this.save(j.access_token, Math.max(60, (j.expires_in || 3600) - 120) * 1000); this.server = 'connected'; return j.access_token; }
+        if(j && j.error==='not_connected'){ this.server = 'disconnected'; return null; }
+        if(r.status===503 || !j){ this.server = 'unconfigured'; return null; }
+        return null;
+      }catch(e){ return null; }
+      finally{ this._inflight = null; }
+    })();
+    return this._inflight;
+  },
   async api(path, opts = {}){
-    const t = this.token(); if(!t) throw {code:'needs_connect'};
+    const t = await this.ensure(); if(!t) throw {code:'needs_connect'};
     let r;
     try{ r = await fetch('https://www.googleapis.com/calendar/v3' + path, {...opts, headers:{Authorization:'Bearer ' + t, 'Content-Type':'application/json'}}); }
     catch(e){ throw {code:'network'}; }
@@ -134,11 +156,12 @@ const gcal = {
   }
 };
 const calOn = () => !!gcal.token();
+const calSilent = () => gcal.server==='connected';
 let calTimer = null;
 function calWindow(){ const t = today(); return {start: addDays(mondayOf(t), -7), end: addDays(mondayOf(t), 21)}; }
 async function loadCalendar(){
   const w = calWindow(); cal.window = w;
-  if(!gcal.token()){ cal.status = 'connect'; cal.error = 'needs_connect'; scheduleRender(); return; }
+  if(!(await gcal.ensure())){ cal.status = 'connect'; cal.error = 'needs_connect'; scheduleRender(); return; }
   if(!cal.events.length) cal.status = 'loading';
   try{
     const q = new URLSearchParams({timeMin: parseYmd(w.start).toISOString(), timeMax: parseYmd(w.end).toISOString(), singleEvents:'true', orderBy:'startTime', maxResults:'250'});
@@ -156,14 +179,14 @@ async function loadCalendar(){
 function startCalendar(){ clearInterval(calTimer); loadCalendar(); loadTeamCal(); calTimer = setInterval(() => { loadCalendar(); loadTeamCal(); }, 300000); }
 
 /* ---- Olympus Team Calendar: "Name - PL" / "Name : UPL" / "Name PL" all-day entries mark people out ---- */
-const teamCal = {status:'idle', off:{}, adj:{}, unmatched:[], storedAt:null};
+const teamCal = {status:'idle', off:{}, adj:{}, meetings:[], unmatched:[], storedAt:null};
 const OUT_RE = /^(.*?)[\s\-–—:|,]+(UPL|PL)\b/i;
 function matchMember(raw){
   const n = raw.toLowerCase().replace(/[^a-z' ]/g,' ').replace(/\s+/g,' ').trim();
   if(!n) return null;
   const team = teamList();
   const tok = n.split(' ');
-  const full = team.find(m => m.name.toLowerCase()===n); if(full) return full;
+  const full = team.find(m => m.name.toLowerCase()===n || (m.aliases||[]).some(x => x.toLowerCase()===n)); if(full) return full;
   const firsts = team.filter(m => m.name.toLowerCase().split(' ')[0]===tok[0] || (m.aliases||[]).map(a=>a.toLowerCase()).includes(tok[0]));
   if(firsts.length===1) return firsts[0];
   if(firsts.length>1 && tok[1]){ const byInitial = firsts.filter(m => m.name.toLowerCase().split(' ').slice(-1)[0].startsWith(tok[1])); if(byInitial.length===1) return byInitial[0]; }
@@ -212,8 +235,8 @@ function parseAdj(title, ev){
 }
 async function loadTeamCal(){
   const id = CFG.teamCalendarId;
-  if(!id || !gcal.token()){ teamCal.status = 'connect'; return; }
-  const t = today(), from = addDays(t, -14), to = addDays(t, 120);
+  if(!id || !(await gcal.ensure())){ teamCal.status = 'connect'; scheduleRender(); return; }
+  const t = today(), from = addDays(t, -60), to = addDays(t, 120);
   try{
     const items = []; let page = '';
     for(let i = 0; i < 6; i++){
@@ -222,10 +245,11 @@ async function loadTeamCal(){
       const j = await gcal.api('/calendars/' + encodeURIComponent(id) + '/events?' + q.toString());
       items.push(...((j && j.items) || [])); page = j && j.nextPageToken; if(!page) break;
     }
-    const off = {}, adj = {}, unmatched = new Set();
+    const off = {}, adj = {}, unmatched = new Set(), meetings = [];
     for(const e of items){
       if(e.status==='cancelled' || !e.start) continue;
       const title = (e.summary || '').trim();
+      if(isOneOnOne(title) && e.start.dateTime){ const ne = normEvent(e); if(ne && ne.team.length){ ne.fromTeamCal = true; meetings.push(ne); } continue; }
       const m = OUT_RE.exec(title);
       if(!m){
         const a = parseAdj(title, e); if(!a) continue;
@@ -250,7 +274,7 @@ async function loadTeamCal(){
         (off[who.id] = off[who.id] || {})[d] = type;
       }
     }
-    teamCal.off = off; teamCal.adj = adj; teamCal.unmatched = [...unmatched].sort(); teamCal.status = 'ok'; teamCal.storedAt = Date.now();
+    teamCal.off = off; teamCal.adj = adj; teamCal.meetings = meetings; teamCal.unmatched = [...unmatched].sort(); teamCal.status = 'ok'; teamCal.storedAt = Date.now();
   }catch(e){ teamCal.status = e.code==='needs_connect' ? 'connect' : e.code==='forbidden' ? 'denied' : 'error'; }
   scheduleRender();
 }
@@ -258,10 +282,23 @@ const calOffFor = (memberId, date) => (teamCal.off[memberId] || {})[date] || nul
 const calAdjFor = (memberId, date) => (teamCal.adj[memberId] || {})[date] || null;
 async function connectCalendar(){
   if(!auth || !auth.currentUser){ toast('Sign in first.'); return; }
+  if(gcal.server!=='unconfigured'){
+    try{
+      const id = await auth.currentUser.getIdToken();
+      const r = await fetch('/api/gcal/start', {method:'POST', headers:{Authorization:'Bearer ' + id}});
+      if(r.ok){ const j = await r.json(); toast('Taking you to Google, one time only...'); location.href = j.url; return; }
+      if(r.status===503 || r.status===404) gcal.server = 'unconfigured';
+      else { toast('Could not start the calendar connection. Try again in a minute.'); return; }
+    }catch(e){}
+  }
   try{
     const r = await auth.currentUser.reauthenticateWithPopup(googleProvider());
-    if(r.credential && r.credential.accessToken){ gcal.save(r.credential.accessToken); startCalendar(); toast('Calendar connected.'); }
+    if(r.credential && r.credential.accessToken){ gcal.save(r.credential.accessToken); startCalendar(); toast('Calendar connected for about an hour.'); }
   }catch(e){ toast(authMsg(e)); }
+}
+async function disconnectCalendar(){
+  try{ const id = await auth.currentUser.getIdToken(); await fetch('/api/gcal/token', {method:'DELETE', headers:{Authorization:'Bearer ' + id}}); }catch(e){}
+  gcal.clear(); gcal.server = 'disconnected'; cal.events = []; cal.status = 'connect'; teamCal.status = 'connect'; renderAll(); toast('Calendar disconnected.');
 }
 function normEvent(e){
   if(!e || e.status==='cancelled' || !e.start) return null;
@@ -272,13 +309,25 @@ function normEvent(e){
   const me = (e.attendees || []).find(a => a.self);
   const people = (e.attendees || []).map(a => a.displayName || '').filter(Boolean);
   const team = teamList().filter(m => people.some(p => p.toLowerCase().includes(m.name.toLowerCase().split(' ')[0]) && p.toLowerCase().includes(m.name.toLowerCase().split(' ').slice(-1)[0]))).map(m => m.id);
-  return {id: safeId(e.id), title: e.summary || '(No title)', date, start, end, allDay, link: e.htmlLink || null, meet: e.hangoutLink || (((e.conferenceData && e.conferenceData.entryPoints) || []).find(x => x.entryPointType==='video') || {}).uri || null,
+  const tm = memberFromTitle(e.summary || ''); if(tm && !team.includes(tm.id)) team.push(tm.id);
+  return {id: safeId(e.id), ical: e.iCalUID || null, title: e.summary || '(No title)', date, start, end, allDay, link: e.htmlLink || null, meet: e.hangoutLink || (((e.conferenceData && e.conferenceData.entryPoints) || []).find(x => x.entryPointType==='video') || {}).uri || null,
     declined: me ? me.responseStatus==='declined' : false, type: e.eventType || 'DEFAULT', count: (e.attendees || []).length, team};
+}
+/* 1:1s: "Maggie - O3", "O3 - Maggie", "Khayla / Maggie 1:1" */
+const O3_RE = /\b(o3|1\s?[:\-]\s?1|1 on 1|one[\s-]on[\s-]one)\b/i;
+const isOneOnOne = title => O3_RE.test(title || '');
+function memberFromTitle(title){
+  if(!isOneOnOne(title) && !/<>|\/\//.test(title || '')) return null;
+  const stripped = title.replace(O3_RE, ' ').replace(/khayla('s)?|mcgowan|\bwith\b|\bx\b|<>|\/\/|[\/|&+]/gi, ' ').replace(/[\-–—:,]+/g, ' ').trim();
+  const direct = stripped && matchMember(stripped); if(direct) return direct;
+  const words = stripped.toLowerCase().split(/\s+/).filter(Boolean);
+  const hits = teamList().filter(m => words.includes(m.name.toLowerCase().split(' ')[0]) || (m.aliases||[]).some(a => words.includes(a.toLowerCase())));
+  return hits.length===1 ? hits[0] : null;
 }
 const safeId = id => String(id || newId()).replace(/[^A-Za-z0-9_\-.~:@+]/g,'_').slice(0,190);
 function guessCat(title){
   const t = (title || '').toLowerCase();
-  if(/\b1\s?[:\-]\s?1\b|one.on.one|\b1 on 1\b|<>|\/\//.test(t)) return 'one';
+  if(/\bo3\b|\b1\s?[:\-]\s?1\b|one.on.one|\b1 on 1\b|<>|\/\//.test(t)) return 'one';
   if(/huddle|stand.?up|team meeting|team sync/.test(t)) return 'huddle';
   if(/\bqa\b|calibrat|quality/.test(t)) return 'qa';
   if(/training|workshop|learning|onboard|ascent|coaching/.test(t)) return 'train';
@@ -289,11 +338,18 @@ function guessCat(title){
 }
 /* Unified meeting list: calendar events overlaid with hub records, plus hub-only meetings. */
 function allMeetings(){
-  const out = [], seen = new Set();
+  const out = [], seen = new Set(), sig = new Set();
+  const key = e => (e.title || '').toLowerCase() + '|' + e.date + '|' + (e.start || '');
   for(const e of cal.events){
     const rec = S.meetings[e.id] || null;
-    seen.add(e.id);
+    seen.add(e.id); sig.add(key(e)); if(e.ical) sig.add(e.ical);
     out.push({...e, source:'gcal', rec, category: (rec && rec.category) || guessCat(e.title), auto: !(rec && rec.category)});
+  }
+  for(const e of (teamCal.meetings || [])){
+    if(seen.has(e.id) || sig.has(key(e)) || (e.ical && sig.has(e.ical))) continue;
+    const rec = S.meetings[e.id] || null;
+    seen.add(e.id); sig.add(key(e));
+    out.push({...e, source:'gcal', rec, category: (rec && rec.category) || 'one', auto: !(rec && rec.category)});
   }
   for(const m of list('meetings')){
     if(seen.has(m.id)) continue;
@@ -306,13 +362,52 @@ function allMeetings(){
   return out.filter(m => m.date).sort((a,b) => (a.date+(a.start||'00:00')).localeCompare(b.date+(b.start||'00:00')));
 }
 function findMeeting(id){ return allMeetings().find(m => m.id===id) || null; }
+const meetingPeople = m => [...new Set([...(m.team || []), ...((m.rec && m.rec.attendees) || [])])];
+/* 1:1s with this person, newest first. Only meetings that have started (or are today). */
+function oneOnOnes(memberId, beforeDate){
+  const t = today(), nm = nowMin();
+  return allMeetings().filter(m => m.category==='one' && !m.declined && meetingPeople(m).includes(memberId)
+    && (beforeDate ? (m.date < beforeDate) : (m.date < t || (m.date===t && (!m.start || toMin(m.start) <= nm)))))
+    .sort((a,b) => (b.date + (b.start||'')).localeCompare(a.date + (a.start||'')));
+}
+const lastO3 = memberId => oneOnOnes(memberId)[0] || null;
+const daysSince = d => Math.round((parseYmd(today()) - parseYmd(d)) / 86400000);
+function soloMember(m){ const p = meetingPeople(m); return p.length===1 ? p[0] : null; }
+function buildAgenda(category, people, date){
+  const base = (CATS[category]?.tpl || []).map(t => ({id:newId(), text:t, done:false}));
+  const who = category==='one' && people.length===1 ? people[0] : null;
+  const m = {date};
+  if(who){
+    const prev = oneOnOnes(who, m.date).find(x => x.rec);
+    const tplTexts = new Set((CATS.one.tpl || []).map(x => x.toLowerCase()));
+    const carried = prev ? (prev.rec.agenda || []).filter(a => !a.done && !tplTexts.has(a.text.toLowerCase())).map(a => ({id:newId(), text:'From last time: ' + a.text.replace(/^From last time: /,''), done:false})) : [];
+    const fus = list('tasks').filter(t => t.memberId===who && !t.done).sort(cmpTask).slice(0,6).map(t => ({id:newId(), text:'Follow-up: ' + t.text, done:false}));
+    const at = base.findIndex(a => /action items/i.test(a.text));
+    const extra = [...carried, ...fus];
+    if(at >= 0) base.splice(at, 0, ...extra); else base.push(...extra);
+  }
+  return base;
+}
 async function ensureRecord(m){
   if(S.meetings[m.id]) return true;
-  return put('meetings', m.id, {gcal:true, title:m.title, date:m.date, start:m.start||null, end:m.end||null, category:m.category, agenda:(CATS[m.category]?.tpl||[]).map(t => ({id:newId(), text:t, done:false})), notes:'', attendees:m.team||[], createdAt:Date.now()});
+  const people = meetingPeople(m);
+  return put('meetings', m.id, {gcal:true, title:m.title, date:m.date, start:m.start||null, end:m.end||null, category:m.category, agenda:buildAgenda(m.category, people, m.date), notes:'', attendees:people, createdAt:Date.now()});
+}
+function lastTimePanel(m){
+  const who = m.category==='one' ? soloMember(m) : null; if(!who || !S.team[who]) return '';
+  const prev = oneOnOnes(who, m.date)[0];
+  const fus = list('tasks').filter(t => t.memberId===who && !t.done).sort(cmpTask);
+  const first = S.team[who].name.split(' ')[0];
+  return `<section class="panel" style="background:var(--surface-2)">
+    <div class="panel-h"><h2>Last time with ${esc(first)}</h2>${prev ? `<span class="small muted">${esc(fmtDate(prev.date,{month:'short',day:'numeric'}))} · ${daysSince(prev.date)} days ago</span>` : ''}<div class="right"><button class="btn sm ghost" data-act="openMember" data-id="${esc(who)}">Profile</button></div></div>
+    ${prev && prev.rec && prev.rec.notes ? `<p style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere">${esc(prev.rec.notes.length > 600 ? prev.rec.notes.slice(0,600) + '…' : prev.rec.notes)}</p>`
+      : `<div class="small muted">${prev ? 'No notes were taken last time.' : 'No earlier 1:1 on record.'}</div>`}
+    ${fus.length ? `<div class="flabel">Open follow-ups for ${esc(first)}</div><ul class="tasks">${fus.slice(0,6).map(t => taskRow(t)).join('')}</ul>` : ''}
+  </section>`;
 }
 async function pushToCalendar(id){
   const m = S.meetings[id]; if(!m) return;
-  if(!calOn()){ await connectCalendar(); if(!calOn()) return; }
+  if(!(await gcal.ensure())){ await connectCalendar(); return; }
   if(!m.start || !m.end){ toast('Add a start and end time first.'); return; }
   toast('Adding to Google Calendar...');
   const agenda = (m.agenda||[]).map(a => '• ' + a.text).join('\n');
@@ -446,6 +541,7 @@ function renderAll(){
 }
 function renderAllInner(){
   renderNav();
+  renderCountdown();
   const pg = PAGES.find(p => p.id===ui.page);
   $('#pageTitle').innerHTML = `${esc(pg.name)} <small>${esc(pg.label)}</small>`;
   $('#view').innerHTML = VIEWS[ui.page]();
@@ -466,7 +562,9 @@ function vSummit(){
   const greet = h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
   const open = list('tasks').filter(t => !t.done);
   const urgent = open.filter(t => ['overdue','today'].includes(bucket(t))).sort(cmpTask);
-  const next = urgent[0] || open.filter(t => bucket(t)==='week').sort(cmpTask)[0] || open.filter(t => bucket(t)==='someday').sort(cmpTask)[0];
+  const picked = S.daily[td] && S.daily[td].firstTask && S.tasks[S.daily[td].firstTask] && !S.tasks[S.daily[td].firstTask].done ? {...S.tasks[S.daily[td].firstTask], id:S.daily[td].firstTask} : null;
+  const next = picked || urgent[0] || open.filter(t => bucket(t)==='week').sort(cmpTask)[0] || open.filter(t => bucket(t)==='someday').sort(cmpTask)[0];
+  const nudge = prepNudge();
   const dn = doneToday(), total = dn + urgent.length, pct = total ? Math.round(dn/total*100) : 0;
   const mtgs = allMeetings().filter(m => m.date===td && !m.allDay);
   const nm = nowMin();
@@ -489,16 +587,21 @@ function vSummit(){
   const lunches = team.map(m => ({m, p:dayPlan(m, td)})).filter(x => x.p.works && !x.p.off && x.p.ls!=null && x.p.le > nm && x.p.ls <= nm+150).sort((a,b) => a.p.ls - b.p.ls);
 
   return `${loadingNote()}
-  <section class="hello"><div><h2>${greet}, Khayla</h2><p>${esc(fmtDate(td,{weekday:'long', month:'long', day:'numeric'}))}</p></div></section>
+  <section class="hello"><div><h2>${greet}, Khayla</h2><p>${esc(fmtDate(td,{weekday:'long', month:'long', day:'numeric'}))}</p></div>
+    <div class="row" style="margin-left:auto">${new Date().getDay()===5 ? '<button class="btn gold" data-act="openWrap">Friday wrap</button>' : '<button class="btn sm ghost" data-act="openWrap">Week wrap</button>'}${shutDone(td) ? '' : `<button class="btn ${h >= 15 ? 'primary' : 'sm ghost'}" data-act="openShutdown">Shut down for today</button>`}</div></section>
+  ${shutDone(td) ? `<div class="olly" style="background:var(--good-soft)">${ICON.laurel}<div><b style="color:var(--good)">Shutdown complete.</b> Everything is captured, and tomorrow starts with: ${picked || (S.daily[nextWorkday(td)] && S.daily[nextWorkday(td)].firstTask) ? '<b>' + esc((S.tasks[(S.daily[nextWorkday(td)]||{}).firstTask]||{}).text || 'your chosen task') + '</b>' : 'whatever is on top'}. You can stop thinking about work now. <button class="btn sm ghost" data-act="reopenDay">Reopen today</button></div></div>` : ''}
   <div class="olly">${ICON.griffon}<div><b>Olly says:</b> ${esc(OLLY[(new Date().getDay()+6)%7])}</div></div>
   <div class="grid g-summit">
     <div class="stack">
       <div class="focus-card">
-        <span class="lbl">The one thing</span>
+        ${nudge ? `<span class="lbl">Before your next meeting</span>
+          <div class="what">Prep ${esc(nudge.title)}. It starts in ${nudge.mins} min${nudge.mins===1?'':'s'}.</div>
+          <div class="row"><button class="btn go" data-act="openMeeting" data-id="${esc(nudge.id)}">Prep it now</button>${next ? `<span class="small" style="color:var(--side-muted)">Then: ${esc(next.text)}</span>` : ''}</div>`
+        : `<span class="lbl">${picked ? 'The one thing (you picked this last night)' : 'The one thing'}</span>
         ${next ? `<div class="what">${esc(next.text)}</div>
           <div class="row">${next.due ? `<span class="chip">${esc(relDay(next.due))}</span>` : ''}${next.priority==='high' ? '<span class="chip">High priority</span>' : ''}${next.memberId ? `<span class="chip">${esc(memberName(next.memberId))}</span>` : ''}</div>
           <div class="row"><button class="btn go" data-act="toggleTask" data-id="${esc(next.id)}">Done, next</button><button class="btn" data-act="snooze" data-id="${esc(next.id)}">Move to tomorrow</button></div>`
-        : `<div class="what">Nothing urgent. Capture a task at the top, or enjoy the clear sky.</div>`}
+        : `<div class="what">Nothing urgent. Capture a task at the top, or enjoy the clear sky.</div>`}`}
       </div>
       <section class="panel">
         <div class="panel-h"><h2>Today's labors</h2><div class="right"><a class="btn sm ghost" href="#labors">All tasks</a></div></div>
@@ -528,6 +631,33 @@ function vSummit(){
   </div>
   ${toolsPanel()}`;
 }
+const DEFAULT_MIN_FLOOR = {chat:4, voice:6};
+const minFloor = ch => { const v = (settings().minFloor || {})[ch]; return v ? Number(v) : DEFAULT_MIN_FLOOR[ch]; };
+/* Where a channel drops below its minimum on a day, compared with a normal day. */
+function coverageDips(d, ch){
+  const mem = teamList().filter(m => m.channel===ch);
+  const plans = mem.map(m => ({m, p: dayPlan(m, d)}));
+  const min = minFloor(ch), dips = [];
+  let cur = null;
+  for(let t = 6*60; t < 22*60; t += 30){
+    let base = 0, on = 0; const why = new Set();
+    for(const {m, p} of plans){
+      if(!p.set) continue;
+      const sh = m.shift || {}, regular = (sh.days || []).includes(parseYmd(d).getDay()) && t >= toMin(sh.start) && t < toMin(sh.end);
+      if(regular) base++;
+      const inShift = p.works && !p.off && t >= p.s && t < p.e;
+      const inGap = p.gaps.some(g => t >= g[0] && t < g[1]);
+      const atLunch = p.ls!=null && t >= p.ls && t < p.le;
+      if(inShift && !inGap && !atLunch) on++;
+      else if(regular && (p.off || inGap || !inShift)) why.add(m.name.split(' ')[0] + (p.off ? ' ' + p.off : inGap ? ' out' : ' hours'));
+    }
+    if(on < min && base >= min){
+      if(cur && cur.end===t && cur.low===on){ cur.end = t + 30; why.forEach(w => cur.why.add(w)); }
+      else { cur = {start:t, end:t+30, low:on, why:new Set(why)}; dips.push(cur); }
+    } else cur = null;
+  }
+  return dips.map(x => ({...x, why:[...x.why]}));
+}
 function outPanel(){
   const t = today(), team = teamList();
   const days = []; for(let i = 0; i < 14 && days.length < 5; i++){ const d = addDays(t, i); const dow = parseYmd(d).getDay(); if(dow===0 || dow===6) continue; days.push(d); }
@@ -537,7 +667,8 @@ function outPanel(){
     const chips = outs.map(x => `<span class="chip out" title="${x.p.fromCal ? 'From Olympus Team Calendar' : 'Set in Sundial'}">${esc(x.m.name.split(' ')[0])} · ${esc(x.p.off)}</span>`)
       .concat(adjs.map(x => `<span class="chip warn" title="From Olympus Team Calendar">${esc(x.m.name.split(' ')[0])} · ${esc(x.p.adj)}</span>`));
     return `<div class="stack" style="gap:6px"><div class="flabel" style="${d===t?'color:var(--accent)':''}">${esc(relDay(d))}${d!==t && d!==addDays(t,1) ? '' : ' · ' + esc(fmtDate(d,{weekday:'short'}))}</div>
-      ${chips.length ? `<div class="people">${chips.join('')}</div>` : '<span class="small muted">Everyone in, regular hours</span>'}</div>`;
+      ${chips.length ? `<div class="people">${chips.join('')}</div>` : '<span class="small muted">Everyone in, regular hours</span>'}
+      ${['chat','voice'].flatMap(ch => coverageDips(d, ch).map(x => `<div class="small" style="color:var(--bad)">⚠ ${ch==='chat'?'Chat':'Voice'} down to ${x.low} (min ${minFloor(ch)}) ${esc(fmtTime(fromMin(x.start)))} to ${esc(fmtTime(fromMin(x.end)))}${x.why.length ? ': ' + esc(x.why.join(', ')) : ''}</div>`)).join('')}</div>`;
   }).join('');
   const note = teamCal.status==='ok'
     ? (teamCal.unmatched.length ? `<div class="small muted">On the team calendar but not on your roster: ${teamCal.unmatched.map(esc).join(', ')}</div>` : '')
@@ -548,6 +679,34 @@ function outPanel(){
     <div class="panel-h"><h2>Out &amp; changes this week</h2>${teamCal.status==='ok' ? '<span class="chip on">Team calendar synced</span>' : ''}</div>
     ${rows}${note}
   </section>`;
+}
+function prepNudge(){
+  const td = today(), nm = nowMin();
+  const m = allMeetings().filter(x => x.date===td && x.start && !x.allDay && !x.declined && x.type!=='WORKING_LOCATION')
+    .find(x => { const d = toMin(x.start) - nm; return d >= 0 && d <= 15 && !(x.rec && (x.rec.agenda || []).length); });
+  return m ? {id:m.id, title:m.title, mins: toMin(m.start) - nm} : null;
+}
+function nextWorkday(d){ let x = addDays(d, 1); while([0,6].includes(parseYmd(x).getDay())) x = addDays(x, 1); return x; }
+const shutDone = d => !!(S.daily[d] && S.daily[d].shutdown);
+/* ---------- header countdown ---------- */
+function countdownInfo(){
+  const td = today(), nm = nowMin();
+  const ms = allMeetings().filter(x => x.date===td && x.start && x.end && !x.allDay && !x.declined && x.type!=='WORKING_LOCATION');
+  const now = ms.find(x => toMin(x.start) <= nm && toMin(x.end) > nm);
+  const nx = ms.find(x => toMin(x.start) > nm);
+  if(now) return {id:now.id, cls:'now', text:`Now: ${now.title}`, sub:`ends ${fmtTime(now.end)}${nx ? ` · next ${fmtTime(nx.start)}` : ''}`};
+  if(nx){ const d = toMin(nx.start) - nm; return {id:nx.id, cls: d <= 10 ? 'soon' : '', text: d < 60 ? `${nx.title} in ${d} min` : `Next: ${nx.title}`, sub: d < 60 ? fmtTime(nx.start) : `at ${fmtTime(nx.start)}`}; }
+  if(cal.status==='ok' && ms.length) return {id:null, cls:'done', text:'No more meetings today', sub:''};
+  return null;
+}
+function renderCountdown(){
+  const el = document.getElementById('countdown'); if(!el) return;
+  const c = countdownInfo();
+  if(!c){ el.hidden = true; return; }
+  el.hidden = false; el.className = 'countdown ' + c.cls;
+  el.innerHTML = `<span class="cd-dot"></span><span class="cd-t">${esc(c.text)}</span>${c.sub ? `<span class="cd-s">${esc(c.sub)}</span>` : ''}`;
+  el.dataset.id = c.id || '';
+  el.disabled = !c.id;
 }
 function calChip(){
   const s = cal.status;
@@ -565,7 +724,9 @@ function calEmpty(msg){
 }
 function calHelp(){
   const c = cal.error;
-  if(cal.status==='connect') return 'Google Calendar is not connected for this session. <button class="btn sm" data-act="calRetry">Connect calendar</button>';
+  if(cal.status==='connect') return gcal.server==='unconfigured'
+    ? 'Google Calendar is not connected for this session. <button class="btn sm" data-act="calRetry">Connect calendar</button>'
+    : 'Google Calendar is not connected yet. Connect once and it stays connected. <button class="btn sm" data-act="calRetry">Connect calendar</button>';
   if(cal.status==='denied') return 'Google refused calendar access' + (cal.message ? ' (' + esc(cal.message) + ')' : '') + '. If this mentions an admin or policy, Custom Ink IT is blocking the app. <button class="btn sm" data-act="calRetry">Try again</button>';
   if(c==='network') return 'You look offline. The calendar will refresh when you reconnect.';
   return 'Google Calendar did not respond. <button class="btn sm" data-act="calRetry">Try again</button>';
@@ -703,7 +864,7 @@ function vSundial(){
 
   const editor = groups.map(ch => `<section class="panel">
     <div class="panel-h"><h2 style="color:var(--${ch})">${ch==='chat'?'Chat':'Voice'} shifts</h2>
-      <div class="right"><label class="small muted" for="ml-${ch}">Max at lunch at once</label><input id="ml-${ch}" type="number" min="1" max="15" style="width:70px;min-height:32px" value="${esc(maxL[ch]||'')}" data-act-change="maxLunch" data-ch="${ch}"></div></div>
+      <div class="right"><label class="small muted" for="mf-${ch}">Min on floor</label><input id="mf-${ch}" type="number" min="1" max="15" style="width:70px;min-height:32px" value="${esc(minFloor(ch))}" data-act-change="minFloor" data-ch="${ch}"><label class="small muted" for="ml-${ch}">Max at lunch at once</label><input id="ml-${ch}" type="number" min="1" max="15" style="width:70px;min-height:32px" value="${esc(maxL[ch]||'')}" data-act-change="maxLunch" data-ch="${ch}"></div></div>
     <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th><th>Work days</th><th>Start</th><th>End</th><th>Lunch</th><th>Length</th></tr></thead><tbody>
     ${teamList().filter(m => m.channel===ch).map(m => { const sh = m.shift || {}; const days = sh.days || [];
       return `<tr><td>${esc(m.name)}</td>
@@ -731,6 +892,31 @@ function vSundial(){
 const DOWL = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
 
 /* ---------- Pantheon ---------- */
+function o3chip(id){
+  const l = lastO3(id);
+  if(!l) return '<span class="chip warn" title="No 1:1 found on your calendars in the last 60 days">No O3 on record</span>';
+  const d = daysSince(l.date);
+  return `<span class="chip ${d > 14 ? 'warn' : 'on'}" title="${esc(l.title)}">${d===0 ? 'O3 today' : 'Last O3 ' + d + 'd ago'}</span>`;
+}
+function attentionList(){
+  const notes = list('notes');
+  return teamList().map(m => {
+    const why = [];
+    const l = lastO3(m.id);
+    if(!l) why.push('No O3 on record'); else if(daysSince(l.date) > 14) why.push(`O3 ${daysSince(l.date)}d ago`);
+    const mine = notes.filter(n => n.memberId===m.id).sort((a,b) => (b.date||'').localeCompare(a.date||''));
+    if(!mine.length || daysSince(mine[0].date) > 30) why.push(mine.length ? `Last note ${daysSince(mine[0].date)}d ago` : 'No notes yet');
+    const lastWin = mine.find(n => n.type==='win');
+    if(!lastWin || daysSince(lastWin.date) > 30) why.push(lastWin ? `Last win ${daysSince(lastWin.date)}d ago` : 'No wins logged');
+    return {m, why};
+  }).filter(x => x.why.length);
+}
+function attentionPanel(){
+  const a = attentionList();
+  if(!a.length) return `<section class="panel"><div class="panel-h"><h2>Attention balance</h2><span class="chip on">Everyone is covered</span></div><div class="small muted">Everyone has had an O3 in the last 2 weeks and a note or win in the last 30 days.</div></section>`;
+  return `<section class="panel"><div class="panel-h"><h2>Could use some attention</h2><span class="chip warn tnum">${a.length}</span><span class="small muted">O3 over 14 days, or no note or win in 30</span></div>
+    <div class="people">${a.map(x => `<button class="pchip" data-act="openMember" data-id="${esc(x.m.id)}" title="${esc(x.why.join(' · '))}"><b>${esc(x.m.name.split(' ')[0])}</b> <span class="muted">${esc(x.why[0])}${x.why.length > 1 ? ' +' + (x.why.length - 1) : ''}</span></button>`).join('')}</div></section>`;
+}
 function vPantheon(){
   const lastWeek = addDays(mondayOf(today()), -7), thisWeek = mondayOf(today());
   const card = m => {
@@ -743,10 +929,10 @@ function vPantheon(){
       <span class="top-r"><span class="ava ${m.channel}">${esc(initials(m.name))}</span><span style="min-width:0"><span class="nm">${esc(m.name)}</span><br><span class="small muted">${m.channel==='chat'?'Chat':'Voice'}</span></span></span>
       <span class="meta"><span class="chip ${s.k}">${esc(s.label)}</span>${openT ? `<span class="chip">${openT} open task${openT>1?'s':''}</span>` : ''}</span>
       ${defs.length ? `<span class="mdots">${defs.map(d => { const v = mval(m.id, wk, d.key); return `<span title="${esc(d.label)}"><i class="sd ${rate(d,v)}"></i>${esc(d.short||d.label)} ${esc(fmtVal(d,v))}</span>`; }).join('')}</span>` : ''}
-      <span class="small muted">${notes.length ? 'Last note ' + esc(relDay(notes[0].date)) : 'No notes yet'}</span>
+      <span class="meta">${o3chip(m.id)}${notes.length ? `<span class="small muted">Last note ${esc(relDay(notes[0].date))}</span>` : '<span class="small muted">No notes yet</span>'}</span>
     </button>`;
   };
-  return `${loadingNote()}${['chat','voice'].map(ch => { const mem = byChannel(ch); return `<section class="stack" style="gap:12px">
+  return `${loadingNote()}${attentionPanel()}${['chat','voice'].map(ch => { const mem = byChannel(ch); return `<section class="stack" style="gap:12px">
     <div class="panel-h"><h2 style="color:var(--${ch})">${ch==='chat'?'Chat':'Voice'} channel</h2><span class="chip tnum">${mem.length}</span></div>
     ${mem.length ? `<div class="team-grid">${mem.map(card).join('')}</div>` : '<div class="empty">No one in this channel yet.</div>'}</section>`; }).join('')}`;
 }
@@ -772,10 +958,11 @@ function vOracle(){
   </section>
   <section class="panel">
     <div class="panel-h"><h2>${ch==='chat'?'Chat':'Voice'} scorecard</h2><div class="right">
-      ${ui.oracleEdit ? '<button class="btn sm ghost" data-act="oCancel">Cancel</button><button class="btn sm primary" data-act="oSave">Save week</button>' : `<button class="btn sm" data-act="oSettings">Metric settings</button><button class="btn sm primary" data-act="oEdit">${anyData ? 'Edit metrics' : 'Enter metrics'}</button>`}</div></div>
+      ${ui.oracleEdit ? '<button class="btn sm ghost" data-act="oCancel">Cancel</button><button class="btn sm primary" data-act="oSave">Save week</button>' : `<button class="btn sm" data-act="oSettings">Metric settings</button><button class="btn sm gold" data-act="pasteOpen">Paste from a sheet</button><button class="btn sm primary" data-act="oEdit">${anyData ? 'Edit metrics' : 'Enter metrics'}</button>`}</div></div>
     ${!anyData && !ui.oracleEdit ? `<div class="empty small">No metrics logged for this week yet. Choose <b>Enter metrics</b> to add them. Dots turn green, amber, or red once a metric has a target.</div>` : ''}
     ${table}
   </section>
+  ${ui.paste ? pastePanel() : ''}
   ${ui.oracleSettings ? settingsPanel() : ''}
   <section class="panel">
     <div class="panel-h"><h2>Trend, last 8 weeks</h2><div class="right"><select id="o-metric" data-act-change="oMetric" aria-label="Metric">${defs.map(d => `<option value="${esc(d.key)}" ${d.key===ui.oracleMetric?'selected':''}>${esc(d.label)}</option>`).join('')}</select></div></div>
@@ -803,18 +990,129 @@ function settingsPanel(){
     <p class="small muted" style="margin:0">Removing a metric hides it; logged numbers stay saved. Leave a target blank to track a number without color coding.</p>
   </section>`;
 }
+/* ---------- Paste-in metrics ---------- */
+const METRIC_SYNONYMS = {
+  csat:['csat','satisfaction','customer satisfaction','sat'],
+  qa:['qa','quality','qa score','quality score','audit'],
+  adh:['adherence','adh','schedule adherence','sched adherence'],
+  aht:['aht','handle time','average handle time','avg handle time'],
+  frt:['frt','first response','first response time','response time'],
+  vol:['contacts','volume','handled','contacts handled','chats','calls','tickets','interactions','vol']
+};
+const normH = h => String(h || '').toLowerCase().replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim();
+function splitRows(raw){
+  const lines = raw.replace(/\r/g,'').split('\n').filter(l => l.trim());
+  if(!lines.length) return [];
+  const delim = lines[0].includes('\t') ? '\t' : (lines[0].includes(',') ? ',' : null);
+  return lines.map(l => {
+    if(delim==='\t') return l.split('\t').map(x => x.trim());
+    if(delim===','){ const out = []; let cur = '', q = false; for(const ch of l){ if(ch==='"'){ q = !q; continue; } if(ch===',' && !q){ out.push(cur.trim()); cur = ''; } else cur += ch; } out.push(cur.trim()); return out; }
+    return l.trim().split(/\s{2,}/);
+  });
+}
+function nameFromCell(v){
+  let t = String(v || '').trim(); if(!t) return null;
+  if(t.includes('@')) t = t.split('@')[0].replace(/[._]/g,' ');
+  if(t.includes(',')){ const [last, first] = t.split(',').map(x => x.trim()); if(first) t = first + ' ' + last; }
+  return matchMember(t) || matchMember(t.split(/\s+/)[0] + ' ' + (t.split(/\s+/).slice(-1)[0] || ''));
+}
+function guessMetric(header, defs){
+  const h = normH(header); if(!h) return '';
+  for(const d of defs){ if([d.key, d.label, d.short].filter(Boolean).map(normH).includes(h)) return d.key; }
+  for(const d of defs){ const syn = METRIC_SYNONYMS[d.key] || []; if(syn.includes(h)) return d.key; }
+  for(const d of defs){ const syn = METRIC_SYNONYMS[d.key] || []; if(syn.some(x => x.length > 2 && h.includes(x))) return d.key; }
+  return '';
+}
+function parsePaste(raw){
+  const rows = splitRows(raw); if(rows.length < 2) return {error:'Paste at least a header row and one person.'};
+  const headers = rows[0], body = rows.slice(1);
+  let nameCol = headers.findIndex(h => /name|agent|employee|associate|rep\b|user|team member|email/i.test(h));
+  if(nameCol < 0){ let best = -1, bestHits = 0; headers.forEach((_, i) => { const hits = body.filter(r => nameFromCell(r[i])).length; if(hits > bestHits){ best = i; bestHits = hits; } }); nameCol = best; }
+  if(nameCol < 0) return {error:'Could not find a column with your team members\' names.'};
+  const defs = metricDefs();
+  const map = headers.map((h, i) => i===nameCol ? '' : guessMetric(h, defs));
+  return {headers, body, nameCol, map};
+}
+function cellValue(raw, def, colVals){
+  let t = String(raw ?? '').trim(); if(!t || /^(-|—|n\/?a|null|none)$/i.test(t)) return null;
+  t = t.replace(/,/g,'');
+  if(/^\d+:\d{1,2}(:\d{1,2})?$/.test(t)){
+    const p = t.split(':').map(Number); const sec = p.length===3 ? p[0]*3600 + p[1]*60 + p[2] : p[0]*60 + p[1];
+    return def.unit==='sec' ? sec : def.unit==='min' ? Math.round(sec/60*100)/100 : sec;
+  }
+  const n = parseFloat(t.replace(/[%$]/g,'')); if(!isFinite(n)) return null;
+  if(def.unit==='%' && !t.includes('%') && colVals.every(x => x==null || Math.abs(x) <= 1)) return Math.round(n*1000)/10;
+  return n;
+}
+function pasteResult(){
+  const p = ui.paste; if(!p || !p.parsed || p.parsed.error) return null;
+  const {body, nameCol, map} = p.parsed, defs = metricDefs();
+  const cols = map.map((k, i) => k ? {i, def: defs.find(d => d.key===k)} : null).filter(x => x && x.def);
+  const people = [], unmatched = [];
+  for(const r of body){
+    const who = nameFromCell(r[nameCol]);
+    if(!who){ if(String(r[nameCol]||'').trim()) unmatched.push(r[nameCol]); continue; }
+    people.push({who, r});
+  }
+  const rawNums = cols.map(c => people.map(x => { const n = parseFloat(String(x.r[c.i]||'').replace(/[,%$]/g,'')); return isFinite(n) ? n : null; }));
+  const rows = people.map(x => ({who:x.who, vals: Object.fromEntries(cols.map((c, ci) => [c.def.key, cellValue(x.r[c.i], c.def, rawNums[ci])]))}));
+  return {cols, rows, unmatched};
+}
+function pastePanel(){
+  const p = ui.paste, wk = ui.oracleWeek, defs = metricDefs();
+  const res = pasteResult();
+  return `<section class="panel" style="border-color:var(--gold)">
+    <div class="panel-h"><h2>Paste metrics for the week of ${esc(fmtDate(wk,{month:'short',day:'numeric'}))}</h2><div class="right"><button class="btn sm ghost" data-act="pasteClose">Close</button></div></div>
+    ${!p.parsed || p.parsed.error ? `
+      <p class="small muted" style="margin:0">Copy a block from Google Sheets, Excel, or a report export, including the header row, and paste it below. Names can be "First Last", "Last, First", or email addresses. Both Chat and Voice can go in one paste.</p>
+      <textarea id="paste-raw" style="min-height:160px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px" placeholder="Agent	CSAT	QA	AHT&#10;Alison Mullen	96%	92	6:40&#10;Blair Hailey	94%	88	7:05">${esc(p.raw || '')}</textarea>
+      ${p.parsed && p.parsed.error ? `<div class="small" style="color:var(--bad)">${esc(p.parsed.error)}</div>` : ''}
+      <div class="row"><button class="btn primary sm" data-act="pasteRead">Read it</button></div>`
+    : `
+      <div class="flabel">Columns</div>
+      <div class="tbl-wrap"><table class="tbl" style="min-width:420px"><thead><tr><th>In your paste</th><th>Goes to</th></tr></thead><tbody>
+        ${p.parsed.headers.map((h, i) => `<tr><td>${esc(h || '(blank)')}</td><td>${i===p.parsed.nameCol ? '<span class="chip on">Names</span>' : `<select id="pm-${i}" data-act-change="pasteMap" data-i="${i}" aria-label="Map ${esc(h)}"><option value="">Ignore</option>${defs.map(d => `<option value="${esc(d.key)}" ${p.parsed.map[i]===d.key?'selected':''}>${esc(d.label)}</option>`).join('')}</select>`}</td></tr>`).join('')}
+      </tbody></table></div>
+      ${res && res.rows.length ? `<div class="flabel">Preview, ${res.rows.length} ${res.rows.length===1?'person':'people'}</div>
+        <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th>${res.cols.map(c => `<th class="num">${esc(c.def.short || c.def.label)}</th>`).join('')}</tr></thead><tbody>
+        ${res.rows.map(r => `<tr><td>${esc(r.who.name)}</td>${res.cols.map(c => `<td class="mv ${rate(c.def, r.vals[c.def.key])}"><i></i>${esc(fmtVal(c.def, r.vals[c.def.key]))}</td>`).join('')}</tr>`).join('')}
+        </tbody></table></div>` : '<div class="empty small">No rows matched your roster yet.</div>'}
+      ${res && res.unmatched.length ? `<div class="small" style="color:var(--warn)">Skipped, not on your roster: ${res.unmatched.map(esc).join(', ')}</div>` : ''}
+      <div class="row"><button class="btn primary sm" data-act="pasteApply" ${res && res.rows.length && res.cols.length ? '' : 'disabled'}>Save to the week of ${esc(fmtDate(wk,{month:'short',day:'numeric'}))}</button><button class="btn sm ghost" data-act="pasteBack">Paste something else</button>
+      <span class="small muted">Blank cells keep whatever was already saved.</span></div>`}
+  </section>`;
+}
+async function applyPaste(){
+  const res = pasteResult(); if(!res || !db) return;
+  const wk = ui.oracleWeek, b = db.batch(); let n = 0;
+  for(const r of res.rows){
+    const id = r.who.id + '__' + wk, prev = S.metrics[id];
+    const values = {...((prev && prev.values) || {})};
+    let changed = false;
+    for(const [k, v] of Object.entries(r.vals)){ if(v==null) continue; if(values[k]!==v){ values[k] = v; changed = true; } }
+    if(!changed) continue;
+    b.set(db.collection('metrics').doc(id), {memberId:r.who.id, week:wk, channel:r.who.channel, values, updatedAt:Date.now()}); n++;
+  }
+  if(!n){ toast('Nothing new to save. Those numbers are already in.'); return; }
+  try{ await b.commit(); ui.paste = null; renderAll(); toast(`Saved metrics for ${n} ${n===1?'person':'people'}.`); }catch(e){ dbErr(e); }
+}
 const VIEWS = {summit:vSummit, agora:vAgora, labors:vLabors, sundial:vSundial, pantheon:vPantheon, oracle:vOracle};
 
 /* =============== modals =============== */
-function openModal(type, id){ ui.modal = {type, id}; ui.armed = null; $('#modal').hidden = false; renderModal(); setTimeout(() => { const f = $('#sheet [data-autofocus]'); if(f) f.focus(); }, 30); }
+function openModal(type, id){ ui.modal = {type, id, openedAt: Date.now()}; ui.armed = null; $('#modal').hidden = false; renderModal(); setTimeout(() => { const f = $('#sheet [data-autofocus]'); if(f) f.focus(); }, 30); }
 function closeModal(){ ui.modal = null; $('#modal').hidden = true; $('#sheet').innerHTML = ''; if(pending){ pending = false; renderAll(); } }
 function renderModal(){
   const {type, id} = ui.modal; let html = '';
   if(type==='meeting') html = modalMeeting(id);
+  else if(type==='shutdown') html = modalShutdown();
+  else if(type==='wrap') html = modalWrap();
   else if(type==='newMeeting') html = modalNewMeeting();
   else if(type==='member') html = modalMember(id);
   else if(type==='task') html = modalTask(id);
-  if(html==null){ closeModal(); return; }
+  if(html==null){
+    if(Date.now() - (ui.modal.openedAt || 0) < 4000){ html = `<div class="sheet-h"><div class="tt"><h2>Opening...</h2></div>${closeBtn}</div>`; setTimeout(() => { if(ui.modal && ui.modal.id===id) renderModal(); }, 600); }
+    else { closeModal(); return; }
+  }
   $('#sheet').innerHTML = html;
 }
 const closeBtn = '<button class="icon-btn" data-act="close" aria-label="Close">' + ICON.x + '</button>';
@@ -835,7 +1133,8 @@ function modalMeeting(id){
   if(!rec){
     return `${head}${links}
       <div class="field"><label for="pm-cat">Category</label><select id="pm-cat" data-act-change="prepCat" data-id="${esc(id)}">${Object.entries(CATS).map(([k,c]) => `<option value="${k}" ${m.category===k?'selected':''}>${esc(c.label)}</option>`).join('')}</select></div>
-      <div class="empty"><b>Not prepped yet.</b> Prep this meeting to get an agenda checklist${cat.tpl.length ? ` (starting from the ${esc(cat.label)} template)` : ''}, private notes, and follow-up tasks.</div>
+      ${lastTimePanel(m)}
+      <div class="empty"><b>Not prepped yet.</b> Prep this meeting to get an agenda checklist${cat.tpl.length ? ` (starting from the ${esc(cat.label)} template)` : ''}${m.category==='one' && soloMember(m) ? ', plus anything left open from last time and their open follow-ups' : ''}, private notes, and follow-up tasks.</div>
       <div><button class="btn primary" data-act="prepMeeting" data-id="${esc(id)}" data-autofocus>Prep this meeting</button></div>`;
   }
   const ag = rec.agenda || [];
@@ -848,6 +1147,7 @@ function modalMeeting(id){
     </div>
     <div class="stack" style="gap:6px"><span class="flabel">Team members in this meeting</span>
       <div class="people">${team.map(p => `<button class="pchip" data-act="toggleAtt" data-id="${esc(id)}" data-m="${esc(p.id)}" aria-pressed="${att.includes(p.id)}">${esc(p.name)}</button>`).join('')}</div></div>
+    ${lastTimePanel(m)}
     <section class="panel">
       <div class="panel-h"><h2>Agenda</h2><span class="small muted tnum">${ag.filter(a=>a.done).length}/${ag.length}</span>${ag.length===0 && cat.tpl.length ? `<div class="right"><button class="btn sm" data-act="loadTpl" data-id="${esc(id)}">Load ${esc(cat.label)} template</button></div>` : ''}</div>
       ${ag.length ? `<ul class="agenda">${ag.map((a,i) => `<li class="${a.done?'done':''}"><button class="chk" style="${a.done?'background:var(--good);border-color:var(--good)':''}" data-act="agToggle" data-id="${esc(id)}" data-i="${i}" aria-label="Toggle ${esc(a.text)}">${a.done ? ICON.check.replace('<svg','<svg style="opacity:1"') : ICON.check}</button><span>${esc(a.text)}</span><span class="ops"><button class="icon-btn" data-act="agMove" data-id="${esc(id)}" data-i="${i}" data-v="-1" aria-label="Move up" ${i===0?'disabled':''}>${ICON.up}</button><button class="icon-btn" data-act="agMove" data-id="${esc(id)}" data-i="${i}" data-v="1" aria-label="Move down" ${i===ag.length-1?'disabled':''}>${ICON.down}</button><button class="icon-btn" data-act="agDel" data-id="${esc(id)}" data-i="${i}" aria-label="Remove">${ICON.x}</button></span></li>`).join('')}</ul>` : '<div class="empty small">No agenda items yet.</div>'}
@@ -867,6 +1167,60 @@ function modalMeeting(id){
         <button class="btn primary" type="submit">Add</button></form>
     </section>
     <div class="row">${isHub ? `<button class="btn sm" data-act="dupMeeting" data-id="${esc(id)}">Copy to next week</button>` : ''}${delBtn('delMeeting', id, isHub ? 'Delete meeting' : 'Clear prep notes')}</div>`;
+}
+function modalShutdown(){
+  const td = today(), tm = nextWorkday(td), st = ui.shut || (ui.shut = {});
+  const loose = list('tasks').filter(t => !t.done && t.due && t.due <= td).sort(cmpTask);
+  const winsToday = list('notes').filter(n => n.type==='win' && n.date===td);
+  const open = list('tasks').filter(t => !t.done).sort(cmpTask);
+  const chosen = (S.daily[tm] || {}).firstTask;
+  const tmMtgs = allMeetings().filter(m => m.date===tm && m.start && !m.allDay && !m.declined).slice(0, 3);
+  const tmOut = teamList().map(m => ({m, p: dayPlan(m, tm)})).filter(x => x.p.off || x.p.adj);
+  const step = (n, key, title, body, ok) => `<section class="panel" style="${ok ? 'border-color:var(--good)' : ''}">
+    <div class="panel-h"><span class="chip ${ok ? 'on' : ''} tnum">${ok ? '✓' : n}</span><h2 style="color:var(--fg)">${title}</h2></div>${body}
+    ${key ? `<label class="row small" style="gap:8px"><input type="checkbox" id="sd-${key}" data-act-change="shutCheck" data-k="${key}" ${st[key] ? 'checked' : ''}> ${key==='loose' ? 'These are handled or moved' : key==='wins' ? 'Nothing else worth logging today' : 'Seen it'}</label>` : ''}
+  </section>`;
+  const done1 = st.loose || !loose.length, done2 = st.wins || winsToday.length > 0, done3 = !!chosen, done4 = !!st.glance;
+  const all = done1 && done2 && done3 && done4;
+  return `<div class="sheet-h"><div class="tt"><h2>Shut down for today</h2><div class="small muted">Four quick checks. Once they're done, the day is closed.</div></div>${closeBtn}</div>
+  ${step(1, loose.length ? 'loose' : '', "Today's loose ends", loose.length ? `<ul class="tasks">${loose.map(t => taskRow(t)).join('')}</ul><div class="small muted">Check them off, or open one to change its date.</div>` : '<div class="small muted">Nothing due today is still open. Nice.</div>', done1)}
+  ${step(2, winsToday.length ? '' : 'wins', 'Wins worth logging', `${winsToday.length ? `<div class="small">${winsToday.length} logged today: ${winsToday.map(n => esc(memberName(n.memberId).split(' ')[0])).join(', ')}</div>` : ''}
+    <form class="addrow" data-form="quickWin" autocomplete="off"><select id="qw-m" aria-label="Who">${teamList().map(m => `<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('')}</select><input type="text" id="qw-t" placeholder="What did they do well?" aria-label="Win"><button class="btn sm" type="submit">Log win</button></form>`, done2)}
+  ${step(3, '', `First task for ${esc(relDay(tm))}`, `<select id="sd-first" data-act-change="shutFirst" data-d="${esc(tm)}" aria-label="First task tomorrow" style="width:100%"><option value="">Pick one...</option>${open.map(t => `<option value="${esc(t.id)}" ${chosen===t.id?'selected':''}>${esc(trunc(t.text, 80))}</option>`).join('')}</select>
+    <form class="addrow" data-form="shutNewFirst" data-d="${esc(tm)}" autocomplete="off"><input type="text" id="sd-newfirst" placeholder="Or type a new one" aria-label="New first task"><button class="btn sm" type="submit">Set</button></form>`, done3)}
+  ${step(4, 'glance', `${esc(relDay(tm))} at a glance`, `<div class="small">${tmMtgs.length ? 'First up: ' + tmMtgs.map(m => `<b>${esc(fmtTime(m.start))}</b> ${esc(m.title)}`).join(', ') : 'No meetings on your calendar yet.'}</div>
+    <div class="small">${tmOut.length ? 'Out or changed: ' + tmOut.map(x => esc(x.m.name.split(' ')[0]) + ' (' + esc(x.p.off || x.p.adj) + ')').join(', ') : 'Everyone in, regular hours.'}</div>`, done4)}
+  <div class="row"><button class="btn primary" data-act="shutFinish" ${all ? '' : 'disabled'}>Close out the day</button><span class="small muted">${all ? 'All set.' : 'Finish the checks above to close out.'}</span></div>`;
+}
+function modalWrap(){
+  const wk = mondayOf(today()), end = addDays(wk, 6), inWk = d => d && d >= wk && d <= end;
+  const wins = list('notes').filter(n => n.type==='win' && inWk(n.date)).sort((a,b) => a.date.localeCompare(b.date));
+  const done = list('tasks').filter(t => t.done && inWk(t.doneAt));
+  const fuDone = done.filter(t => t.meetingId);
+  const carry = list('tasks').filter(t => !t.done && t.due && t.due <= end).sort(cmpTask);
+  const o3s = allMeetings().filter(m => m.category==='one' && inWk(m.date) && m.date <= today() && !m.declined);
+  const o3Names = [...new Set(o3s.flatMap(meetingPeople))].map(memberName).filter(Boolean);
+  const stale = teamList().filter(m => { const l = lastO3(m.id); return !l || daysSince(l.date) > 14; });
+  const offDays = {}; teamList().forEach(m => { for(let i = 0; i < 5; i++){ const d = addDays(wk, i); const p = dayPlan(m, d); if(p.off) offDays[m.name] = (offDays[m.name] || []).concat(p.off); } });
+  const lines = [
+    `Week of ${fmtDate(wk,{month:'short',day:'numeric'})}`,
+    `Wins logged: ${wins.length}` + (wins.length ? '\n' + wins.map(n => `  - ${memberName(n.memberId)}: ${n.text}`).join('\n') : ''),
+    `Tasks completed: ${done.length} (${fuDone.length} meeting follow-ups)`,
+    `O3s held: ${o3s.length}` + (o3Names.length ? ` (${o3Names.join(', ')})` : ''),
+    stale.length ? `Due for an O3: ${stale.map(m => m.name).join(', ')}` : 'Everyone has had an O3 in the last 2 weeks',
+    `Carrying over: ${carry.length}` + (carry.length ? '\n' + carry.map(t => '  - ' + t.text).join('\n') : ''),
+    Object.keys(offDays).length ? 'Time off: ' + Object.entries(offDays).map(([n, a]) => `${n} (${a.length} day${a.length>1?'s':''} ${[...new Set(a)].join('/')})`).join(', ') : 'No PL or UPL this week'
+  ];
+  ui.wrapText = lines.join('\n');
+  const stat = (n, l) => `<div class="stat"><b>${n}</b><span>${l}</span></div>`;
+  return `<div class="sheet-h"><div class="tt"><h2>Week wrap</h2><div class="small muted">Week of ${esc(fmtDate(wk,{month:'long',day:'numeric'}))}</div></div>${closeBtn}</div>
+  <div class="stat-row">${stat(wins.length,'Wins')}${stat(done.length,'Tasks done')}${stat(o3s.length,'O3s held')}${stat(carry.length,'Carrying over')}</div>
+  <section class="panel"><div class="panel-h"><h2>Wins logged</h2></div>${wins.length ? `<ul class="notes-list">${wins.map(n => `<li class="note win"><div class="nh"><b style="color:var(--fg)">${esc(memberName(n.memberId))}</b><span>${esc(fmtDate(n.date,{weekday:'short'}))}</span></div><p>${esc(n.text)}</p></li>`).join('')}</ul>` : '<div class="empty small">No wins logged this week. Worth a minute before the weekend.</div>'}</section>
+  <section class="panel"><div class="panel-h"><h2>O3 coverage</h2></div><div class="small">${o3Names.length ? 'Held with: ' + o3Names.map(esc).join(', ') : 'No O3s found this week.'}</div>${stale.length ? `<div class="small" style="color:var(--warn)">Due (14+ days or none on record): ${stale.map(m => esc(m.name)).join(', ')}</div>` : ''}</section>
+  <section class="panel"><div class="panel-h"><h2>Carrying into next week</h2><span class="chip tnum">${carry.length}</span></div>${carry.length ? `<ul class="tasks">${carry.map(t => taskRow(t)).join('')}</ul>` : '<div class="empty small">Nothing overdue. Clean slate for Monday.</div>'}</section>
+  ${Object.keys(offDays).length ? `<section class="panel"><div class="panel-h"><h2>Time off this week</h2></div><div class="people">${Object.entries(offDays).map(([n, a]) => `<span class="chip out">${esc(n.split(' ')[0])} · ${a.length}d ${esc([...new Set(a)].join('/'))}</span>`).join('')}</div></section>` : ''}
+  <div class="row"><button class="btn primary" data-act="copyWrap">Copy as text</button><span class="small muted">Paste into Slack or an email to your leader.</span></div>
+  <textarea id="wrap-text" readonly style="min-height:120px;font-size:12.5px" aria-label="Week wrap as text">${esc(ui.wrapText)}</textarea>`;
 }
 function modalNewMeeting(){
   const team = teamList();
@@ -895,6 +1249,7 @@ function modalMember(id){
   const defs = defsFor(m.channel); const wk = mondayOf(td); const weeks = [0,1,2,3,4,5].map(i => addDays(wk, -7*i));
   return `<div class="sheet-h"><span class="ava lg ${m.channel}">${esc(initials(m.name))}</span><div class="tt"><h2>${esc(m.name)}</h2><div class="row" style="gap:6px;margin-top:4px"><span class="chip ch-${m.channel}">${m.channel==='chat'?'Chat':'Voice'}</span><span class="chip ${s.k}">${esc(s.label)}</span></div></div>${closeBtn}</div>
   <div class="fields">
+    <div class="field"><label for="mb-alias">Calendar nicknames</label><input id="mb-alias" type="text" value="${esc((m.aliases || []).join(', '))}" placeholder="e.g. Mel, MJ" data-act-change="aliases" data-id="${esc(id)}"></div>
     <div class="field"><label for="mb-ch">Channel</label><select id="mb-ch" data-bind="team:${esc(id)}:channel"><option value="chat" ${m.channel==='chat'?'selected':''}>Chat</option><option value="voice" ${m.channel==='voice'?'selected':''}>Voice</option></select></div>
     <div class="field"><span class="flabel">Shift</span><span class="small">${sh.start && sh.end ? `${esc(fmtTime(sh.start))} to ${esc(fmtTime(sh.end))}, ${(sh.days||[]).slice().sort((a,b)=>((a+6)%7)-((b+6)%7)).map(d => DOWL[d].slice(0,3)).join(' ')}` : 'Not set'}</span></div>
     <div class="field"><span class="flabel">Lunch</span><span class="small">${sh.lunch ? `${esc(fmtTime(sh.lunch))}, ${esc(sh.lunchLen||30)} min` : 'Not set'}</span></div>
@@ -939,6 +1294,11 @@ function modalTask(id){
 }
 
 /* =============== actions =============== */
+function armOrRunInline(key, el, fn){
+  if(ui.armed===key){ ui.armed = null; fn(); return; }
+  ui.armed = key; const orig = el.textContent; el.textContent = 'Tap again to confirm'; el.classList.add('armed');
+  setTimeout(() => { if(ui.armed===key){ ui.armed = null; el.textContent = orig; el.classList.remove('armed'); } }, 3500);
+}
 function armOrRun(key, fn){ if(ui.armed===key){ ui.armed = null; fn(); } else { ui.armed = key; renderModal(); setTimeout(() => { if(ui.armed===key){ ui.armed = null; if(ui.modal) renderModal(); } }, 3500); } }
 async function addTask(o){
   const id = newId();
@@ -954,7 +1314,7 @@ async function toggleTask(id, el){
 }
 async function createMeeting(o){
   const id = newId();
-  const ok = await put('meetings', id, {title:o.title, category:o.category, date:o.date, start:o.start||null, end:o.end||null, attendees:o.attendees||[], agenda:(CATS[o.category]?.tpl||[]).map(t => ({id:newId(), text:t, done:false})), notes:'', createdAt:Date.now()});
+  const ok = await put('meetings', id, {title:o.title, category:o.category, date:o.date, start:o.start||null, end:o.end||null, attendees:o.attendees||[], agenda:buildAgenda(o.category, o.attendees||[], o.date), notes:'', createdAt:Date.now()});
   return ok ? id : null;
 }
 async function editAgenda(id, fn){
@@ -987,7 +1347,8 @@ document.addEventListener('click', async e => {
     case 'pushCal': await pushToCalendar(id); break;
     case 'newOneOne': { const m = S.team[id]; closeModal(); openModal('newMeeting'); setTimeout(() => { const t = $('#nm-title'), c = $('#nm-cat'), w = $('#nm-member'); if(t) t.value = '1:1 with ' + m.name.split(' ')[0]; if(c) c.value = 'one'; if(w) w.value = id; }, 40); break; }
     case 'delNote': armOrRun('delNote'+id, async () => { await remove('notes', id); }); break;
-    case 'calRetry': if(!calOn()) await connectCalendar(); else await loadCalendar(); break;
+    case 'calRetry': if(!(await gcal.ensure())) await connectCalendar(); else { await loadCalendar(); await loadTeamCal(); } break;
+    case 'calDisconnect': armOrRunInline('calDisconnect', el, disconnectCalendar); break;
     case 'signOut': gcal.clear(); if(auth) await auth.signOut(); break;
     case 'importPick': { const f = $('#imp-file'); if(f) f.click(); break; }
     case 'importRun': await runImport(); break;
@@ -1006,6 +1367,16 @@ document.addEventListener('click', async e => {
     case 'oEdit': ui.oracleEdit = true; renderAll(); { const f = $('#view input[type=number]'); if(f) f.focus(); } break;
     case 'oCancel': ui.oracleEdit = false; renderAll(); break;
     case 'oSave': await saveMetrics(); break;
+    case 'pasteOpen': ui.paste = {raw:'', parsed:null}; ui.oracleEdit = false; renderAll(); setTimeout(() => { const t = $('#paste-raw'); if(t) t.focus(); }, 30); break;
+    case 'pasteClose': ui.paste = null; renderAll(); break;
+    case 'pasteBack': ui.paste.parsed = null; renderAll(); break;
+    case 'pasteRead': { const t = $('#paste-raw'); ui.paste.raw = t ? t.value : ''; ui.paste.parsed = parsePaste(ui.paste.raw); pending = false; renderAll(); break; }
+    case 'pasteApply': await applyPaste(); break;
+    case 'openShutdown': ui.shut = {}; openModal('shutdown'); break;
+    case 'openWrap': openModal('wrap'); break;
+    case 'shutFinish': { const ok = await put('daily', today(), {...(S.daily[today()] || {}), shutdown:true, at:Date.now()}); if(ok){ closeModal(); burst(el); toast('Day closed. Go be a person.'); } break; }
+    case 'reopenDay': await patch('daily', today(), {shutdown:false}); break;
+    case 'copyWrap': { const t = ui.wrapText || ''; try{ await navigator.clipboard.writeText(t); toast('Copied.'); }catch(err){ const a = $('#wrap-text'); if(a){ a.focus(); a.select(); } toast('Press Ctrl+C to copy the selected text.'); } break; }
     case 'oSettings': ui.oracleSettings = !ui.oracleSettings; ui.metricDraft = null; renderAll(); break;
     case 'mCancel': ui.oracleSettings = false; ui.metricDraft = null; renderAll(); break;
     case 'mAdd': readDraft(); ui.metricDraft.push({key:'m'+Date.now().toString(36), label:'New metric', short:'', unit:'', dir:'up', target:null, channels:['chat','voice']}); renderAll(); break;
@@ -1052,8 +1423,13 @@ document.addEventListener('change', async e => {
   }
   const act = el.dataset.actChange; if(!act) return;
   if(act==='setOff'){ await patch('team', el.dataset.id, {off:{[ui.sunDate]: el.value || null}}); }
+  else if(act==='aliases'){ const a = el.value.split(',').map(x => x.trim()).filter(Boolean); await patch('team', el.dataset.id, {aliases:a}); loadTeamCal(); }
+  else if(act==='minFloor'){ const cur = clone(settings()) || {}; cur.minFloor = {...(cur.minFloor||{}), [el.dataset.ch]: el.value ? Number(el.value) : null}; await put('config', 'settings', cur); }
   else if(act==='maxLunch'){ const cur = clone(settings()) || {}; cur.maxLunch = {...(cur.maxLunch||{}), [el.dataset.ch]: el.value ? Number(el.value) : null}; await put('config', 'settings', cur); }
   else if(act==='sunDate'){ if(el.value){ ui.sunDate = el.value; pending = false; renderAll(); } }
+  else if(act==='pasteMap'){ if(ui.paste && ui.paste.parsed) ui.paste.parsed.map[+el.dataset.i] = el.value; pending = false; renderAll(); }
+  else if(act==='shutCheck'){ ui.shut = {...(ui.shut || {}), [el.dataset.k]: el.checked}; renderModal(); }
+  else if(act==='shutFirst'){ if(el.value) await put('daily', el.dataset.d, {...(S.daily[el.dataset.d] || {}), firstTask: el.value}); }
   else if(act==='oMetric'){ ui.oracleMetric = el.value; pending = false; renderAll(); }
   else if(act==='prepCat'){ const m = findMeeting(el.dataset.id); if(m){ m.category = el.value; await ensureRecord(m); } }
 });
@@ -1067,6 +1443,10 @@ document.addEventListener('submit', async e => {
   else if(kind==='agendaAdd'){ const t = val('#ag-new').trim(); if(!t) return; await editAgenda(id, ag => ag.push({id:newId(), text:t, done:false})); const i = $('#ag-new'); if(i){ i.value = ''; i.focus(); } }
   else if(kind==='followAdd'){ const t = val('#fu-text').trim(); if(!t) return; if(await addTask({text:t, due:val('#fu-due'), memberId:val('#fu-member'), meetingId:id})){ const i = $('#fu-text'); if(i){ i.value = ''; i.focus(); } } }
   else if(kind==='noteAdd'){ const t = val('#nn-text').trim(); if(!t) return; const ok = await put('notes', newId(), {memberId:id, type:val('#nn-type'), date:val('#nn-date') || today(), text:t, createdAt:Date.now()}); if(ok){ const i = $('#nn-text'); if(i) i.value = ''; toast('Note saved.'); } }
+  else if(kind==='quickWin'){ const t = val('#qw-t').trim(); if(!t) return; const ok = await put('notes', newId(), {memberId:val('#qw-m'), type:'win', date:today(), text:t, createdAt:Date.now()}); if(ok){ toast('Win logged.'); } }
+  else if(kind==='shutNewFirst'){ const t = val('#sd-newfirst').trim(); if(!t) return; const id = newId(); const d = f.dataset.d;
+    const ok = await put('tasks', id, {text:t, due:d, priority:'high', memberId:null, meetingId:null, done:false, doneAt:null, createdAt:Date.now()});
+    if(ok) await put('daily', d, {...(S.daily[d] || {}), firstTask:id}); }
   else if(kind==='memberTask'){ const t = val('#mtk-text').trim(); if(!t) return; if(await addTask({text:t, due:val('#mtk-due'), memberId:id})){ const i = $('#mtk-text'); if(i) i.value = ''; } }
   else if(kind==='newMeeting'){
     const title = val('#nm-title').trim(); if(!title) return;
@@ -1110,6 +1490,7 @@ function burst(el){
 function route(){ const h = (location.hash || '').slice(1); ui.page = PAGES.some(p => p.id===h) ? h : 'summit'; if(ui.modal) closeModal(); renderAll(); window.scrollTo(0,0); }
 window.addEventListener('hashchange', route);
 setInterval(() => { if(['summit','sundial','pantheon','agora'].includes(ui.page)) scheduleRender(); }, 60000);
+setInterval(() => { try{ renderCountdown(); }catch(e){} }, 20000);
 
 /* =============== auth, data, import =============== */
 const CFG = window.OLYMPUS_CONFIG || {};
@@ -1161,7 +1542,7 @@ function hideGate(){ $('#gate').hidden = true; }
 function stopData(){ unsubs.forEach(u => { try{ u(); }catch(e){} }); unsubs = []; for(const k of Object.keys(S)) S[k] = {}; for(const k of Object.keys(loaded)) delete loaded[k]; clearInterval(calTimer); cal.events = []; cal.status = 'idle'; }
 function startData(){
   stopData();
-  for(const col of ['team','meetings','tasks','metrics','notes','config']){
+  for(const col of ['team','meetings','tasks','metrics','notes','config','daily']){
     unsubs.push(db.collection(col).onSnapshot(snap => {
       const o = {}; snap.docs.forEach(d => { o[d.id] = d.data(); }); S[col] = o; loaded[col] = true;
       scheduleRender();
@@ -1180,7 +1561,7 @@ document.addEventListener('change', e => {
 });
 async function runImport(){
   const d = ui.importData; if(!d || !db) return;
-  const cols = ['team','tasks','meetings','notes','metrics','config'];
+  const cols = ['team','tasks','meetings','notes','metrics','config','daily'];
   const writes = []; cols.forEach(c => Object.entries(d[c] || {}).forEach(([id, v]) => { if(v && typeof v==='object') writes.push([c, id, v]); }));
   try{
     for(let i = 0; i < writes.length; i += 400){
@@ -1197,6 +1578,8 @@ function toolsPanel(){
   const u = auth && auth.currentUser;
   return `<section class="panel">
     <div class="panel-h"><h2>Hub tools</h2><div class="right"><span class="small muted">${u ? 'Signed in as ' + esc(u.email) : ''}</span><button class="btn sm" data-act="signOut">Sign out</button></div></div>
+    <div class="row"><span class="small">Calendar: ${calSilent() ? '<b style="color:var(--good)">connected, stays on</b>' : calOn() ? '<b>connected for this session</b>' : '<b style="color:var(--warn)">not connected</b>'}</span>
+      ${calSilent() ? '<button class="btn sm danger" data-act="calDisconnect">Disconnect calendar</button>' : '<button class="btn sm" data-act="calRetry">Connect calendar</button>'}</div>
     ${d ? `<div class="empty">Ready to import ${counts.map(([c,n]) => `<b>${n}</b> ${c}`).join(', ')}. Records with the same ID are overwritten.</div>
       <div class="row"><button class="btn primary sm" data-act="importRun">Import now</button><button class="btn sm ghost" data-act="importCancel">Cancel</button></div>`
       : `<div class="row"><button class="btn sm" data-act="importPick">Import data from a file</button><span class="small muted">Use this once to bring over your roster and shifts.</span></div>`}
@@ -1204,8 +1587,17 @@ function toolsPanel(){
   </section>`;
 }
 
+if('serviceWorker' in navigator){ window.addEventListener('load', () => { navigator.serviceWorker.register('/sw.js').catch(() => {}); }); }
 let wrongEmail = null;
+function readCalReturn(){
+  const p = new URLSearchParams(location.search); const c = p.get('cal'); if(!c) return;
+  const msg = {connected:'Calendar connected. It will stay connected now.', declined:'Calendar connection was cancelled.', expired:'That took too long. Choose Connect calendar again.', not_configured:'The calendar server is not set up yet.', error:'Google did not finish connecting. Try Connect calendar again.'}[c];
+  history.replaceState(null, '', location.pathname + location.hash);
+  if(c==='connected'){ gcal.server = 'unknown'; gcal.clear(); }
+  setTimeout(() => toast(msg || 'Calendar updated.'), 400);
+}
 function boot(){
+  readCalReturn();
   route();
   if(typeof firebase==='undefined'){ setBanner('Could not load Firebase. Check your connection and reload.'); return; }
   const fb = CFG.firebase || {};
